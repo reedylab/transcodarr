@@ -1,5 +1,35 @@
 # Changelog
 
+## v1.2.0 (2026-06-27)
+
+First release published as a prebuilt Docker image — `docker pull ghcr.io/reedylab/transcodarr:1.2.0` (or `:latest`).
+
+### Added
+- **Real-time UI via Server-Sent Events** — status, media, logs, and system streams replace polling; keyed row diffing updates table rows in place instead of rebuilding the whole table
+- **Server-side pagination** with infinite scroll, status filtering, total counts, and bulk-by-filter actions (transcode / ignore / set-output by filter, plus select-all-matching)
+- **Postgres-backed media cache** with one-shot JSON→DB migration; cache survives container rebuilds
+- **Re-encode-only mode** with optional watch paths, for batch re-encoding existing libraries
+- **Re-transcode circuit breaker** to stop repeated failed re-transcodes
+- Auto-start watchdog on container boot when `AUTO_WORKERS > 0`
+- Official prebuilt Docker image published to GHCR via GitHub Actions CI (#3, #5)
+- Mobile-responsive UI (header wrap, 2-column tile grid, full-screen modal) and a floating scroll-to-top button
+- Auto-detect Radarr/Sonarr path remapping; configurable extra-file-extensions
+- Static assets auto cache-busted by file mtime
+
+### Changed
+- **BREAKING:** renamed `X264_THREADS` → `ENCODER_THREADS`; the thread setting now applies to all codecs, not just x264
+- **BREAKING:** replaced hardcoded media folder names with four configurable volume mounts (`MOVIES_WATCH_PATH`, `TV_WATCH_PATH`, `MOVIES_OUTPUT_PATH`, `TV_OUTPUT_PATH`); compose refuses to start if any is unset
+- Consolidated the settings UI from 10 sections to 4
+- ffmpeg command builder now honors codec and HDR settings
+- SSE media stream narrowed to in-flight items only, shrinking the first-connect payload
+- README overhaul: restructured Quick Start, refreshed screenshots, updated API table
+
+### Fixed
+- Tile-view progress percentage showing 100× too large
+- Hardened `meta.json` handling against malformed/partial files
+- Bulk enrich now walks the output folders instead of the (possibly empty) DB cache
+- Radarr/Sonarr path-lookup fallback and corrected path-remap direction for metadata enrichment
+
 ## v1.1.0 (2026-03-31)
 
 ### Changed

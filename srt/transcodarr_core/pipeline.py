@@ -723,7 +723,8 @@ def transcode_file(file_path: str, settings: Settings):
             add_transcode_history(final_path, file_path, source_size, processing_duration, copied=False)
             logging.info("[HISTORY] Recorded transcode: %s → %s", file_path, final_path)
         except Exception as e:
-            logging.debug("[TRANSCODE-META] Failed to write history: %s", e)
+            logging.warning("[TRANSCODE-META] Failed to write history for %s: %s: %s",
+                            file_path, type(e).__name__, e)
 
         # ---------- cleanup progress file ----------
         with contextlib.suppress(Exception):
@@ -874,7 +875,19 @@ def transcode_file(file_path: str, settings: Settings):
                             with contextlib.suppress(Exception):
                                 os.remove(mf)
                     else:
-                        logging.info("[CLEANUP] Unknown kind; keeping source.")
+                        # Output was produced successfully but we can't classify the
+                        # source (no metadata → kind unknown), so cleanup can't safely
+                        # remove it. Ignore the source to prevent an infinite
+                        # re-transcode loop on every scan. See circuit breaker in
+                        # walk_and_process for the same self-healing intent.
+                        logging.warning(
+                            "[CLEANUP] Unknown kind for %s; output exists at %s. "
+                            "Adding source to ignore list to prevent re-transcode loop "
+                            "(investigate why metadata enrichment produced no kind).",
+                            file_path, final_path,
+                        )
+                        with contextlib.suppress(Exception):
+                            set_ignored(file_path, reason="cleanup: unknown kind (missing metadata); output already produced")
                 else:
                     logging.warning(f"[CLEANUP] ep mismatch at finalize (src={ep_src}, final={ep_final}); keeping source.")
             else:
@@ -954,7 +967,8 @@ def copy_compatible_file(file_path: str, settings: Settings):
             add_transcode_history(final_path, file_path, source_size, processing_duration=0, copied=True)
             logging.info("[HISTORY] Recorded copy: %s → %s", file_path, final_path)
         except Exception as e:
-            logging.debug("[COPY] Failed to write history: %s", e)
+            logging.warning("[COPY] Failed to write history for %s: %s: %s",
+                            file_path, type(e).__name__, e)
 
         # ---------- write NFO next to final ----------
         meta_path = find_meta_json(file_path)
@@ -1054,7 +1068,16 @@ def copy_compatible_file(file_path: str, settings: Settings):
                         with contextlib.suppress(Exception):
                             os.remove(mf)
                 else:
-                    logging.info("[CLEANUP] Unknown kind; keeping source.")
+                    # Output produced but source unclassifiable (missing metadata);
+                    # ignore it so we don't re-copy on every scan (see finalize path).
+                    logging.warning(
+                        "[CLEANUP] Unknown kind for %s; output exists at %s. "
+                        "Adding source to ignore list to prevent re-process loop "
+                        "(investigate why metadata enrichment produced no kind).",
+                        file_path, final_path,
+                    )
+                    with contextlib.suppress(Exception):
+                        set_ignored(file_path, reason="cleanup: unknown kind (missing metadata); output already produced")
             else:
                 logging.warning(f"[CLEANUP] ep mismatch (src={ep_src}, final={ep_final}); keeping source.")
 

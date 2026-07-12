@@ -520,6 +520,20 @@ def transcode_file(file_path: str, settings: Settings):
         if not is_reencode:
             try:
                 meta = load_unified_meta(file_path) or {}
+                if not meta:
+                    # No sidecar next to the media — the external write_meta script
+                    # didn't run, or the episode title contains characters it choked
+                    # on (e.g. "ronny/lily"). Build one from Radarr/Sonarr by path and
+                    # persist it next to the source so downstream NFO/poster AND source
+                    # cleanup can classify the file. Without this, cleanup hits
+                    # "Unknown kind", never removes the source, and the watchdog
+                    # re-transcodes it on every scan.
+                    built = build_meta_json_from_arr(file_path, s, src_dir)
+                    if built:
+                        meta = load_unified_meta(file_path) or {}
+                        logging.info("[ENRICH] Built sidecar from Radarr/Sonarr path lookup: %s", built)
+                    else:
+                        logging.warning("[ENRICH] No sidecar and no Radarr/Sonarr match for: %s", file_path)
                 if (meta.get("kind") or "").lower() == "episode":
                     enrich_episode_ids(file_path)  # writes back to .meta.json if needed
             except Exception as e:
@@ -944,6 +958,15 @@ def copy_compatible_file(file_path: str, settings: Settings):
 
         # Load meta for kind detection
         meta = load_unified_meta(file_path) or {}
+        if not meta:
+            # No sidecar next to the media — build one from Radarr/Sonarr by path so
+            # cleanup can classify the file (see transcode_file for rationale).
+            built = build_meta_json_from_arr(file_path, s, src_dir)
+            if built:
+                meta = load_unified_meta(file_path) or {}
+                logging.info("[ENRICH] Built sidecar from Radarr/Sonarr path lookup: %s", built)
+            else:
+                logging.warning("[ENRICH] No sidecar and no Radarr/Sonarr match for: %s", file_path)
         kind = (meta.get("kind") or "").lower()
         ep_src = get_ep_code(file_path)
         container = s.TARGET_CONTAINER or ".mp4"

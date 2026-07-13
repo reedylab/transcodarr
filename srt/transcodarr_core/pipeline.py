@@ -725,6 +725,11 @@ def transcode_file(file_path: str, settings: Settings):
 
         # ---------- save transcode metadata to database ----------
         try:
+            # Explicit import: `from transcodarr_core import *` (top of module) runs
+            # during package init before __init__ binds this name, so the star import
+            # misses it and a bare reference NameErrors at runtime — which silently
+            # disabled transcode-history recording (and the circuit breaker with it).
+            from .database import add_transcode_history
             processing_duration = None
             if os.path.exists(progress_file):
                 with open(progress_file, "r", encoding="utf-8") as f:
@@ -987,6 +992,7 @@ def copy_compatible_file(file_path: str, settings: Settings):
 
         # ---------- save to database ----------
         try:
+            from .database import add_transcode_history  # star import misses it at init time; see transcode_file
             add_transcode_history(final_path, file_path, source_size, processing_duration=0, copied=True)
             logging.info("[HISTORY] Recorded copy: %s → %s", file_path, final_path)
         except Exception as e:

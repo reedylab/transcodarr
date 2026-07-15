@@ -1,0 +1,24 @@
+# Hardware transcoding on NVIDIA GPUs (NVENC).
+#
+# Overlay this on the base compose file — the base stays GPU-less so it works
+# on hosts without a GPU:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.gpu-nvidia.yml up -d --build
+#
+# Requires the NVIDIA Container Toolkit on the host (it injects the driver and
+# NVENC libraries into the container — the image carries no NVIDIA driver):
+#   https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html
+#
+# Set NVIDIA_VISIBLE_DEVICES in .env to pin a specific GPU (e.g. GPU-<uuid> or 0).
+services:
+  transcodarr:
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=${NVIDIA_VISIBLE_DEVICES:-all}
+      - NVIDIA_DRIVER_CAPABILITIES=video,compute,utility
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu, video]

@@ -1,0 +1,21 @@
+# Hardware transcoding on Intel (QSV / VAAPI) or AMD (VAAPI) GPUs.
+#
+# Overlay this on the base compose file — the base stays GPU-less so it works
+# on hosts without a GPU:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d --build
+#
+# RENDER_GID must match the "render" group on YOUR host — the GID varies by
+# distro (Ubuntu 24.04: 993, Debian 12: 106). Find it with:
+#
+#   getent group render | cut -d: -f3
+#
+# Without the right GID the container can open no render node and ffmpeg fails
+# with "Failed to open the given device".
+services:
+  transcodarr:
+    devices:
+      - "${GPU_DEVICE:-/dev/dri}:${GPU_DEVICE:-/dev/dri}"
+    group_add:
+      - "${RENDER_GID:?Set RENDER_GID in .env - see the comment above}"
+      - "${VIDEO_GID:-44}"

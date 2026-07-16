@@ -141,6 +141,33 @@ def _encodable_codecs(profiles: dict[str, list[str]]) -> set[str]:
     return codecs
 
 
+# VA profile prefix -> ffprobe codec_name, for reading DECODE (VLD) support. Wider
+# than the encode map: GPUs decode far more than they encode (MPEG-2/VC1/VP8...),
+# and these are matched against a source's ffprobe codec_name to gate HW decode.
+_VA_DECODE_CODECS = [
+    ("VAProfileH264", "h264"),
+    ("VAProfileHEVC", "hevc"),
+    ("VAProfileVP9", "vp9"),
+    ("VAProfileVP8", "vp8"),
+    ("VAProfileMPEG2", "mpeg2video"),
+    ("VAProfileVC1", "vc1"),
+    ("VAProfileAV1", "av1"),
+]
+
+
+def _decodable_codecs(profiles: dict[str, list[str]]) -> list[str]:
+    """Source codecs (ffprobe names) the driver reports a hardware DECODE (VLD)
+    entrypoint for — the input to hardware-decode gating."""
+    codecs: set[str] = set()
+    for profile, entrypoints in profiles.items():
+        if not any(e.startswith("VAEntrypointVLD") for e in entrypoints):
+            continue
+        for prefix, codec in _VA_DECODE_CODECS:
+            if profile.startswith(prefix):
+                codecs.add(codec)
+    return sorted(codecs)
+
+
 def _node_id() -> str:
     return os.environ.get("NODE_ID") or "local"
 
@@ -216,6 +243,7 @@ def _software_backend(encoders: set[str]) -> dict:
         "driver": None,
         "encoders": available,
         "codecs": sorted({_canonical(c) for c in available}),
+        "decode_codecs": [],  # software decode isn't gated; ffmpeg handles any input
         "max_sessions": _DEFAULT_MAX_SESSIONS["software"],
         "reason": None if available else "no software encoders in this ffmpeg build",
     }
@@ -232,6 +260,7 @@ def _dri_backend(backend: str, encoders: set[str], hwaccels: set[str]) -> dict:
         "driver": None,
         "encoders": {},
         "codecs": [],
+        "decode_codecs": [],
         "max_sessions": _DEFAULT_MAX_SESSIONS[backend],
         "reason": None,
     }
@@ -266,6 +295,7 @@ def _dri_backend(backend: str, encoders: set[str], hwaccels: set[str]) -> dict:
             driver=_va_driver_name(node),
             encoders=usable,
             codecs=sorted({_canonical(c) for c in usable}),
+            decode_codecs=_decodable_codecs(profiles),
             reason=None,
         )
         return entry
@@ -285,6 +315,10 @@ def _nvenc_backend(encoders: set[str], hwaccels: set[str]) -> dict:
         "driver": None,
         "encoders": {},
         "codecs": [],
+        # NVDEC decode isn't probed here (no NVIDIA hardware to verify against), so
+        # this is a documented best-effort list rather than a measured one. Ampere+
+        # adds av1; older cards will simply fail HW decode and fall back to software.
+        "decode_codecs": ["h264", "hevc", "vp9", "vp8", "mpeg2video", "vc1", "av1"],
         "max_sessions": _DEFAULT_MAX_SESSIONS["nvenc"],
         "reason": None,
     }

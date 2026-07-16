@@ -77,6 +77,7 @@ def detect_hdr(path: str) -> dict:
                 "color_transfer": color_transfer,
                 "color_primaries": color_primaries,
                 "pix_fmt": pix_fmt,
+                "codec_name": (st.get("codec_name") or "").lower(),
                 "height": int(st.get("height", 0)),
                 "width": int(st.get("width", 0)),
             }
@@ -86,6 +87,7 @@ def detect_hdr(path: str) -> dict:
         "color_transfer": "",
         "color_primaries": "",
         "pix_fmt": "",
+        "codec_name": "",
         "height": 0,
         "width": 0,
     }

@@ -298,6 +298,130 @@ def _hw_upload_filters(backend: str) -> list[str]:
     return []
 
 
+# Source codec (ffprobe codec_name) -> the QSV decoder to request explicitly. QSV
+# HW decode needs the decoder named (unlike VAAPI's generic -hwaccel).
+_QSV_DECODER = {
+    "h264": "h264_qsv", "hevc": "hevc_qsv", "vp9": "vp9_qsv",
+    "mpeg2video": "mpeg2_qsv", "vc1": "vc1_qsv", "av1": "av1_qsv",
+}
+
+
+def _hw_decodable(backend: str, source_codec: str) -> bool:
+    """Whether `backend` can hardware-decode `source_codec` on this host.
+
+    Gated on the driver's actual decode (VLD) list — a UHD 630 decodes H.264/HEVC/
+    VP9/MPEG-2/VC1 but not AV1, and feeding an undecodable source to -hwaccel fails
+    outright rather than falling back.
+    """
+    if backend not in ("vaapi", "qsv", "nvenc") or not source_codec:
+        return False
+    try:
+        from .capabilities import get_backend
+        info = get_backend(backend)
+    except Exception:
+        return False
+    if not info or not info.get("available"):
+        return False
+    if backend == "qsv" and source_codec not in _QSV_DECODER:
+        return False
+    return source_codec in (info.get("decode_codecs") or [])
+
+
+def _hw_decode_args(backend: str, source_codec: str, device: str | None) -> list[str]:
+    """Pre-input args to decode on the GPU. Empty = software decode (current path)."""
+    if backend == "vaapi" and device:
+        return ["-hwaccel", "vaapi", "-hwaccel_output_format", "vaapi", "-vaapi_device", device]
+    if backend == "qsv" and device:
+        dec = _QSV_DECODER.get(source_codec)
+        if not dec:
+            return []
+        return ["-init_hw_device", f"vaapi=va:{device}", "-init_hw_device", "qsv=hw@va",
+                "-filter_hw_device", "hw", "-c:v", dec]
+    if backend == "nvenc":
+        return ["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"]
+    return []
+
+
+def _even(n: float) -> int:
+    """Round to the nearest even integer (H.264/HEVC need even dimensions)."""
+    return int(round(n / 2)) * 2
+
+
+def _gpu_scale_filter(backend: str, resolution: str, src_w: int, src_h: int) -> str:
+    """
+    GPU scaling filter for the full-decode pipeline, or "" for no scaling.
+
+    Mirrors the CPU path's aspect-preserving 1080p_max / explicit-WxH / source
+    behaviour. QSV's vpp_qsv rejects auto width (w=-1), so the width is computed
+    from the source aspect ratio; VAAPI/NVENC accept -2.
+    """
+    res = (resolution or "").lower()
+    if res == "source":
+        return ""
+    if res == "1080p_max":
+        if src_h and src_h <= 1080:
+            return ""  # already <=1080p, no downscale
+        target_h = 1080
+        target_w = _even(src_w * 1080 / src_h) if src_h else 1920
+    else:
+        try:
+            w, h = res.split("x")
+            target_w, target_h = int(w), int(h)
+        except (ValueError, AttributeError):
+            return ""
+
+    if backend == "vaapi":
+        return f"scale_vaapi=w={target_w}:h={target_h}:format=nv12"
+    if backend == "qsv":
+        return f"vpp_qsv=w={target_w}:h={target_h}"
+    if backend == "nvenc":
+        return f"scale_cuda=w={target_w}:h={target_h}"
+    return ""
+
+
+def _use_full_gpu_decode(enc_backend: str, hdr_action: str, tonemap_method: str,
+                         source_codec: str, pix_fmt: str) -> bool:
+    """
+    Whether to decode on the GPU and keep frames there through encode — the big win
+    (measured ~4x faster, far less CPU), but only when the whole chain can consume
+    GPU surfaces.
+
+    Anything else uses the existing path (CPU decode -> scale -> hwupload -> HW
+    encode), which stays correct and is the fallback, not a regression.
+    """
+    if enc_backend not in ("vaapi", "qsv", "nvenc"):
+        return False
+    if not _hw_decodable(enc_backend, source_codec):
+        return False
+    if hdr_action == "passthrough":
+        return False  # encode is software anyway
+    if hdr_action == "tonemap":
+        # Only the VA-API GPU tonemap keeps everything on the device; QSV/OpenCL
+        # tonemap can't cleanly consume/feed the decode surfaces, so those decode
+        # on the CPU.
+        return enc_backend == "vaapi" and tonemap_method == "vaapi"
+    # SDR. QSV's vpp 10->8 handling isn't wired up, so 10-bit SDR uses the CPU path.
+    if enc_backend == "qsv" and "10" in (pix_fmt or ""):
+        return False
+    return True
+
+
+def _full_gpu_filters(enc_backend: str, hdr_action: str, resolution: str,
+                      src_w: int, src_h: int, is_10bit: bool) -> list[str]:
+    """Filter chain for the full-decode pipeline. Frames are already GPU surfaces
+    (from -hwaccel decode), so there's no hwupload and no software format pass."""
+    vf: list[str] = []
+    if hdr_action == "tonemap":  # VA-API only; outputs nv12
+        vf.append("tonemap_vaapi=format=nv12:matrix=bt709:primaries=bt709:transfer=bt709")
+    gpu_scale = _gpu_scale_filter(enc_backend, resolution, src_w, src_h)
+    if gpu_scale:
+        vf.append(gpu_scale)
+    elif enc_backend == "vaapi" and is_10bit and hdr_action != "tonemap":
+        # 10-bit SDR with no scaling still needs a 10->8 pass for h264_vaapi.
+        vf.append("scale_vaapi=format=nv12")
+    return vf
+
+
 def _hw_video_encoder_args(codec: str, backend: str, preset: str, profile: str,
                            quality: str) -> list[str]:
     """Build hardware video encoder args, mirroring _video_encoder_args' shape."""
@@ -401,24 +525,38 @@ def build_ffmpeg_cmd(file_path: str, srt_path: str, out_temp: str, settings=None
     enc_backend = "software"
     hw_device: str | None = None
     tonemap_method = "software"
+    full_gpu = False
+    source_codec = ""
+    src_w = src_h = 0
+    is_10bit = False
     if video_mode != "copy":
         hdr_info = detect_hdr(file_path)
         hdr_action = _resolve_hdr_action(hdr_mode, video_codec) if hdr_info["is_hdr"] else "none"
+        source_codec = hdr_info.get("codec_name", "")
+        src_w, src_h = hdr_info.get("width", 0), hdr_info.get("height", 0)
+        is_10bit = "10" in (hdr_info.get("pix_fmt", "") or "")
         requested = backend if backend is not None else _get("HW_BACKEND", "software")
         enc_backend, hw_device = _resolve_backend(
             requested, (video_codec or "h264").lower(), hdr_action, file_path
         )
         if hdr_action == "tonemap" and enc_backend != "software":
             tonemap_method = _resolve_tonemap(_get("TARGET_TONEMAP", "auto"), enc_backend, file_path)
+        if enc_backend != "software":
+            full_gpu = _use_full_gpu_decode(enc_backend, hdr_action, tonemap_method,
+                                            source_codec, hdr_info.get("pix_fmt", ""))
 
     cmd = [
         "ffmpeg", "-y", "-y", "-threads", ffmpeg_threads,
         "-progress", "pipe:1", "-nostats",
     ]
-    # A GPU tonemapper brings its own device chain (OpenCL derives from VAAPI);
-    # otherwise the encoder's own device init applies.
-    _tm_dev = _tonemap_device_args(tonemap_method, hw_device)
-    cmd += _tm_dev if _tm_dev else _hw_device_args(enc_backend, hw_device)
+    if full_gpu:
+        # Decode straight onto the GPU; frames never touch the CPU.
+        cmd += _hw_decode_args(enc_backend, source_codec, hw_device)
+    else:
+        # A GPU tonemapper brings its own device chain (OpenCL derives from VAAPI);
+        # otherwise the encoder's own device init applies.
+        _tm_dev = _tonemap_device_args(tonemap_method, hw_device)
+        cmd += _tm_dev if _tm_dev else _hw_device_args(enc_backend, hw_device)
     cmd += ["-i", file_path]
     if srt_safe:
         cmd += ["-sub_charenc", "UTF-8", "-i", srt_safe]
@@ -430,6 +568,17 @@ def build_ffmpeg_cmd(file_path: str, srt_path: str, out_temp: str, settings=None
         cmd += ["-map", "1:0"]
     if video_mode == "copy":
         cmd += ["-c:v", "copy"]
+    elif full_gpu:
+        # Full GPU pipeline: decode + tonemap + scale + encode, no CPU frame copies.
+        which = "GPU tonemap+" if hdr_action == "tonemap" else ""
+        logging.info("[HW] %s: full GPU pipeline (%s decode, %sscale, %s encode)",
+                     os.path.basename(file_path), source_codec, which, enc_backend)
+        vf_all = _full_gpu_filters(enc_backend, hdr_action, resolution, src_w, src_h, is_10bit)
+        if vf_all:
+            cmd += ["-vf", ",".join(vf_all)]
+        # No -pix_fmt and no hwupload: frames are hardware surfaces already.
+        cmd += _hw_video_encoder_args((video_codec or "h264").lower(), enc_backend,
+                                      preset, profile, crf)
     else:
         # hdr_info / hdr_action were resolved above (before the device args).
 

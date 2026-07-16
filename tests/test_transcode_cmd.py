@@ -30,9 +30,18 @@ _HDR_PROBE = {
 
 
 def _build(overrides, out="/tmp/out.mp4", hdr_info=None):
-    """Run build_ffmpeg_cmd with mocked probe + settings_override."""
+    """Run build_ffmpeg_cmd with mocked probe + settings_override.
+
+    get_setting is stubbed to return each caller's own default. Without this the
+    builder reads the live settings DB for anything `overrides` doesn't set, so
+    results depend on whatever preset the host happens to have active (e.g. a
+    stored VIDEO_STREAM_MODE=copy silently skips the whole encoder block) and the
+    suite passes in CI but fails on a configured machine.
+    """
     probe = hdr_info or _SDR_PROBE
-    with patch("transcodarr_core.ffmpeg.transcode.detect_hdr", return_value=probe):
+    with patch("transcodarr_core.ffmpeg.transcode.detect_hdr", return_value=probe), \
+         patch("transcodarr_core.ffmpeg.transcode.get_setting",
+               side_effect=lambda key, default=None: default):
         return build_ffmpeg_cmd(
             file_path="/tmp/in.mkv",
             srt_path=None,

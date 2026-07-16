@@ -30,7 +30,7 @@ DB_BACKED_SETTINGS = {
     "TARGET_VIDEO_CODEC", "TARGET_AUDIO_CODEC", "TARGET_CONTAINER", "TARGET_RESOLUTION",
     "TARGET_PRESET", "TARGET_PROFILE", "TARGET_AUDIO_BITRATE", "TARGET_AUDIO_CHANNELS",
     "TARGET_CRF", "TARGET_AUDIO_NORMALIZE", "TARGET_HDR_MODE",
-    "ENCODER_THREADS", "X264_THREADS", "FFMPEG_THREADS",
+    "ENCODER_THREADS", "X264_THREADS", "FFMPEG_THREADS", "HW_BACKEND",
     "SUBLIMINAL_OSCOM_USER", "SUBLIMINAL_OSCOM_PASS", "SUBLIMINAL_OSCOM_ACCOUNTS",
     "SUBLIMINAL_OSCOM_ENABLED", "SUBLIMINAL_PODNAPISI_ENABLED",
     "SUBLIMINAL_ADDIC7ED_ACCOUNTS", "SUBLIMINAL_ADDIC7ED_ENABLED",
@@ -113,6 +113,10 @@ class Settings(BaseSettings):
     ENCODER_THREADS: str = "4"
     X264_THREADS: str = "4"  # legacy — superseded by ENCODER_THREADS, kept for fallback reads
     FFMPEG_THREADS: str = "1"
+    # Video encode backend: software | qsv | vaapi | nvenc. Defaults to software so
+    # upgrades never silently move existing installs onto hardware; unavailable
+    # backends fall back to software per-job anyway.
+    HW_BACKEND: str = "software"
     FLASK_SECRET: str | None = None
     ADMIN_API_KEY: str | None = None
     UI_REQUIRES_LOGIN: bool = False

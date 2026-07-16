@@ -29,6 +29,30 @@ _VIDEO_ENCODER = {
     "av1":  "libsvtav1",
 }
 
+# Hardware encoders per backend. Only codecs we can actually drive are listed —
+# capability detection still has the final say per host (a GPU may ship the
+# encoder but not the encode entrypoint, e.g. VP9 on Gen9.5).
+_HW_VIDEO_ENCODER = {
+    "qsv":   {"h264": "h264_qsv",   "h265": "hevc_qsv",   "hevc": "hevc_qsv"},
+    "vaapi": {"h264": "h264_vaapi", "h265": "hevc_vaapi", "hevc": "hevc_vaapi"},
+    "nvenc": {"h264": "h264_nvenc", "h265": "hevc_nvenc", "hevc": "hevc_nvenc"},
+}
+
+# Quality knob per backend. All are ~0-51 quantizer scales like x264's CRF, so the
+# configured number carries over unscaled — but a hardware encoder at a given QP
+# is generally less efficient than x264 at the same CRF, so expect to spend a few
+# points to match software quality.
+_HW_QUALITY_FLAG = {"qsv": "-global_quality", "vaapi": "-qp", "nvenc": "-cq"}
+
+# x264-style preset names -> NVENC p-levels (p1 fastest .. p7 slowest).
+_NVENC_PRESET_MAP = {
+    "ultrafast": "p1", "superfast": "p1", "veryfast": "p2", "faster": "p3",
+    "fast": "p4", "medium": "p4", "slow": "p5", "slower": "p6", "veryslow": "p7",
+}
+
+# QSV accepts x264-style preset names but has no ultrafast/superfast.
+_QSV_PRESET_MAP = {"ultrafast": "veryfast", "superfast": "veryfast"}
+
 _AUDIO_ENCODER = {
     "aac":  "aac",
     "ac3":  "ac3",
@@ -95,6 +119,97 @@ def _video_encoder_args(codec: str, preset: str, profile: str, crf: str, threads
     return args
 
 
+def _resolve_backend(requested: str | None, codec: str, hdr_action: str,
+                     file_path: str) -> tuple[str, str | None]:
+    """Pick the encode backend, returning (backend, device).
+
+    Always degrades to software rather than failing a job: an unavailable GPU,
+    an unsupported codec, or a failed probe costs speed, not the transcode.
+    """
+    backend = (requested or "software").lower()
+    if backend in ("", "software", "sw", "none"):
+        return "software", None
+
+    name = os.path.basename(file_path)
+
+    # HDR stays on software until the hardware tonemap path lands: the tonemap
+    # chain is software (zscale) and passthrough needs 10-bit hardware surfaces.
+    if hdr_action in ("tonemap", "passthrough"):
+        logging.info("[HW] %s: HDR (%s) not supported on %s yet — using software",
+                     name, hdr_action, backend)
+        return "software", None
+
+    if backend not in _HW_VIDEO_ENCODER:
+        logging.warning("[HW] unknown backend %r — using software", backend)
+        return "software", None
+    if codec not in _HW_VIDEO_ENCODER[backend]:
+        logging.info("[HW] %s: %s has no %s encoder — using software", name, backend, codec)
+        return "software", None
+
+    try:
+        from .capabilities import get_backend
+        info = get_backend(backend)
+    except Exception as e:
+        logging.warning("[HW] capability probe failed (%s) — using software", e)
+        return "software", None
+
+    if not info or not info.get("available"):
+        logging.warning("[HW] %s unavailable (%s) — using software",
+                        backend, (info or {}).get("reason"))
+        return "software", None
+    if codec not in info.get("encoders", {}):
+        logging.warning("[HW] %s cannot encode %s on this host — using software", backend, codec)
+        return "software", None
+
+    return backend, info.get("device")
+
+
+def _hw_device_args(backend: str, device: str | None) -> list[str]:
+    """Hardware device init. Must precede -i, and is empty for software."""
+    if backend == "vaapi" and device:
+        return ["-vaapi_device", device]
+    if backend == "qsv":
+        if device:
+            # Pin QSV to a specific render node via a VAAPI parent — a bare
+            # "qsv=hw" grabs an arbitrary GPU on multi-GPU hosts.
+            return ["-init_hw_device", f"vaapi=va:{device}",
+                    "-init_hw_device", "qsv=hw@va", "-filter_hw_device", "hw"]
+        return ["-init_hw_device", "qsv=hw", "-filter_hw_device", "hw"]
+    return []
+
+
+def _hw_upload_filters(backend: str) -> list[str]:
+    """Filters that move frames onto the GPU. NVENC takes software frames directly."""
+    if backend == "vaapi":
+        return ["format=nv12", "hwupload"]
+    if backend == "qsv":
+        return ["format=nv12", "hwupload=extra_hw_frames=64"]
+    return []
+
+
+def _hw_video_encoder_args(codec: str, backend: str, preset: str, profile: str,
+                           quality: str) -> list[str]:
+    """Build hardware video encoder args, mirroring _video_encoder_args' shape."""
+    encoder = _HW_VIDEO_ENCODER[backend][codec]
+    args: list[str] = ["-c:v", encoder]
+
+    if preset:
+        if backend == "qsv":
+            args += ["-preset", _QSV_PRESET_MAP.get(preset.lower(), preset)]
+        elif backend == "nvenc":
+            args += ["-preset", _NVENC_PRESET_MAP.get(preset.lower(), "p4")]
+        # VAAPI has no preset knob (it exposes -compression_level instead).
+
+    # Match the software path: profile is only meaningful for h264 here.
+    if profile and codec == "h264":
+        args += ["-profile:v", profile]
+
+    if quality:
+        args += [_HW_QUALITY_FLAG[backend], quality]
+
+    return args
+
+
 def _audio_encoder_args(codec: str, bitrate: str, channels: str) -> list[str]:
     """Build per-codec audio encoder args. FLAC is lossless so bitrate is skipped."""
     codec = (codec or "aac").lower()
@@ -125,7 +240,15 @@ def _resolve_hdr_action(hdr_mode: str, video_codec: str) -> str:
     return "tonemap" if codec == "h264" else "passthrough"
 
 def build_ffmpeg_cmd(file_path: str, srt_path: str, out_temp: str, settings=None,
-                     settings_override: dict | None = None) -> list[str]:
+                     settings_override: dict | None = None,
+                     backend: str | None = None) -> list[str]:
+    """Assemble the ffmpeg command.
+
+    `backend` selects the video encode backend ("software", "qsv", "vaapi",
+    "nvenc"); None falls back to the HW_BACKEND setting. Anything hardware is
+    validated against this node's detected capabilities and silently degrades to
+    software, so callers can ask for hardware without handling absence.
+    """
     def _get(key, default):
         if settings_override and key in settings_override:
             return settings_override[key]
@@ -160,11 +283,26 @@ def build_ffmpeg_cmd(file_path: str, srt_path: str, out_temp: str, settings=None
     # Sanitize the SRT for mov_text robustness (if provided)
     srt_safe = sanitize_for_movtext(srt_path) if srt_path else None
 
+    # Probe and pick the backend before assembling the command: hardware device
+    # init has to sit ahead of -i. Only relevant when we're actually encoding.
+    hdr_info: dict | None = None
+    hdr_action = "none"
+    enc_backend = "software"
+    hw_device: str | None = None
+    if video_mode != "copy":
+        hdr_info = detect_hdr(file_path)
+        hdr_action = _resolve_hdr_action(hdr_mode, video_codec) if hdr_info["is_hdr"] else "none"
+        requested = backend if backend is not None else _get("HW_BACKEND", "software")
+        enc_backend, hw_device = _resolve_backend(
+            requested, (video_codec or "h264").lower(), hdr_action, file_path
+        )
+
     cmd = [
         "ffmpeg", "-y", "-y", "-threads", ffmpeg_threads,
         "-progress", "pipe:1", "-nostats",
-        "-i", file_path,
     ]
+    cmd += _hw_device_args(enc_backend, hw_device)
+    cmd += ["-i", file_path]
     if srt_safe:
         cmd += ["-sub_charenc", "UTF-8", "-i", srt_safe]
     cmd += [
@@ -176,9 +314,7 @@ def build_ffmpeg_cmd(file_path: str, srt_path: str, out_temp: str, settings=None
     if video_mode == "copy":
         cmd += ["-c:v", "copy"]
     else:
-        # Probe source for HDR metadata and dimensions (single ffprobe call)
-        hdr_info = detect_hdr(file_path)
-        hdr_action = _resolve_hdr_action(hdr_mode, video_codec) if hdr_info["is_hdr"] else "none"
+        # hdr_info / hdr_action were resolved above (before the device args).
 
         # Build composable video filter chain
         vf_filters: list[str] = []
@@ -208,17 +344,31 @@ def build_ffmpeg_cmd(file_path: str, srt_path: str, out_temp: str, settings=None
             w, h = resolution.split("x")
             vf_filters.append(f"scale={w}:{h}")
 
-        if vf_filters:
-            cmd += ["-vf", ",".join(vf_filters)]
+        # VAAPI/QSV need frames uploaded to the GPU as the last filter step.
+        # Scaling stays on the CPU for now — the aspect-preserving scale=-2:1080
+        # behaviour is shared with the software path, and encode is the expensive
+        # part we're offloading. A full GPU pipeline (hwaccel decode +
+        # scale_vaapi) is a later optimisation.
+        upload_filters = _hw_upload_filters(enc_backend)
+        vf_all = vf_filters + upload_filters
+        if vf_all:
+            cmd += ["-vf", ",".join(vf_all)]
 
         # Pixel format: tonemap chain already ends with format=yuv420p.
         # HDR passthrough needs 10-bit. SDR encode gets standard 8-bit yuv420p.
-        if hdr_action == "passthrough":
-            cmd += ["-pix_fmt", "yuv420p10le"]
-        elif hdr_action == "none":
-            cmd += ["-pix_fmt", "yuv420p"]
+        # Skipped when uploading to the GPU — the hwupload chain sets the format
+        # and an explicit -pix_fmt fights the hardware frames context.
+        if not upload_filters:
+            if hdr_action == "passthrough":
+                cmd += ["-pix_fmt", "yuv420p10le"]
+            elif hdr_action == "none":
+                cmd += ["-pix_fmt", "yuv420p"]
 
-        cmd += _video_encoder_args(video_codec, preset, profile, crf, encoder_threads)
+        if enc_backend == "software":
+            cmd += _video_encoder_args(video_codec, preset, profile, crf, encoder_threads)
+        else:
+            cmd += _hw_video_encoder_args((video_codec or "h264").lower(), enc_backend,
+                                          preset, profile, crf)
 
         # Preserve source color metadata on HDR passthrough so players render correctly.
         if hdr_action == "passthrough":

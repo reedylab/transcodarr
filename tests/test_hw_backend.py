@@ -58,18 +58,21 @@ def test_unknown_backend_falls_back():
     assert _resolve_backend("magic-gpu", "h264", "none", "/x.mkv") == ("software", None)
 
 
-def test_shipped_hardware_preset_sets_explicit_quality():
+@pytest.mark.parametrize("backend,label", [("qsv", "QSV"), ("vaapi", "VA-API"), ("nvenc", "NVENC")])
+def test_hardware_preset_is_backend_specific_and_sets_quality(backend, label):
     """
-    TARGET_CRF="" means CRF 23 to libx264 but "no quality target" to a hardware
-    encoder, which then drops into a default bitrate mode. Measured on a UHD 630:
-    h264_qsv with no quality flag scored SSIM 0.966 / 0.11 MB vs 0.983 / 0.75 MB
-    at global_quality 23. The shipped preset must never leave this blank.
+    One preset per detected backend, each naming its own backend explicitly.
+
+    TARGET_CRF is set on purpose: "" means CRF 23 to libx264 but "no quality
+    target" to a hardware encoder, which then drops into a default bitrate mode.
+    Measured on a UHD 630: h264_qsv with no quality flag scored SSIM 0.966 /
+    0.11 MB vs 0.983 / 0.75 MB at global_quality 23.
     """
-    from transcodarr_core.database import DEFAULT_PRESETS
-    hw = next(p for p in DEFAULT_PRESETS if p["name"] == "4K Downscale (Hardware)")
+    from transcodarr_core.database import _hardware_preset
+    hw = _hardware_preset(backend)
+    assert hw["name"] == f"4K Downscale ({label})"
+    assert hw["settings"]["HW_BACKEND"] == backend      # explicit, never "auto"
     assert hw["settings"]["TARGET_CRF"], "hardware preset must set an explicit quality"
-    assert hw["settings"]["HW_BACKEND"] not in ("", "auto", None), \
-        "backend must be explicit — it is pinned to the detected one at seed time"
     assert hw["settings"]["TARGET_RESOLUTION"] == "1080p_max"
 
 

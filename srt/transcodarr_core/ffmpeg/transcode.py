@@ -4,6 +4,7 @@ import os, subprocess, logging, contextlib, json
 from dataclasses import dataclass
 from ..config import Settings, get_setting
 from ..ffmpeg.probe import get_duration_seconds, ffprobe_json, detect_hdr
+from ..ffmpeg.limits import hw_slot
 from ..subtitles.sanitize import sanitize_for_movtext
 
 @dataclass
@@ -527,7 +528,10 @@ def run_ffmpeg(file_path: str, srt_path: str, out_path: str, base_name: str, s: 
     try:
         logging.info(f"[SUBS] Trying standard trancode with subs.")
         cmd = build_ffmpeg_cmd(file_path, srt_path, out_path, s, settings_override=settings_override)
-        _log_progress(cmd)
+        # Hardware commands hold a global slot so the auto and manual pools can't
+        # jointly exceed the GPU's session ceiling; software passes straight through.
+        with hw_slot(cmd):
+            _log_progress(cmd)
         if not os.path.exists(out_path):
             raise RuntimeError(f"Expected output not found: {out_path}")
         return
@@ -541,7 +545,8 @@ def run_ffmpeg(file_path: str, srt_path: str, out_path: str, base_name: str, s: 
     try:
         logging.info("[SUBS] Trying fallback: transcode without subs, then mux subs.")
         cmd_no_subs = build_ffmpeg_cmd(file_path, None, tmp_no_subs, s, settings_override=settings_override)
-        _log_progress(cmd_no_subs)
+        with hw_slot(cmd_no_subs):
+            _log_progress(cmd_no_subs)
         if not os.path.exists(tmp_no_subs):
             raise RuntimeError(f"Fallback transcode produced no output: {tmp_no_subs}")
     except Exception as e:

@@ -201,6 +201,12 @@ SETTINGS_SCHEMA = {
                 {"value": "tonemap", "label": "Tonemap to SDR (always)"},
                 {"value": "passthrough", "label": "Passthrough HDR (always)"},
             ]},
+            "HW_BACKEND": {"label": "Encode Backend", "type": "select", "group": "video", "options": [
+                {"value": "software", "label": "Software (libx264/x265) — best quality per bitrate"},
+                {"value": "qsv", "label": "Intel Quick Sync (QSV) — hardware"},
+                {"value": "vaapi", "label": "VA-API (Intel/AMD) — hardware"},
+                {"value": "nvenc", "label": "NVIDIA NVENC — hardware"},
+            ]},
             "REQUIRE_SUBTITLES": {"label": "Require Subtitles", "type": "select", "group": "audio", "options": [
                 {"value": "true", "label": "Required (skip if unavailable)"},
                 {"value": "false", "label": "Optional (transcode without if unavailable)"},
@@ -278,6 +284,13 @@ SETTINGS_SCHEMA = {
             ]},
             "AUTO_WORKERS": {"label": "Auto Workers", "type": "select", "hint": "Workers for automatic watchdog transcodes", "group": "advanced", "options": [
                 {"value": "0", "label": "0 (Disabled)"},
+                {"value": "1", "label": "1"},
+                {"value": "2", "label": "2"},
+                {"value": "3", "label": "3"},
+                {"value": "4", "label": "4"},
+            ]},
+            "HW_MAX_WORKERS": {"label": "Hardware Encode Cap", "type": "select", "hint": "Max concurrent hardware encodes across all workers — a GPU session limit, not a preference. Blank uses what the detected device reports.", "group": "advanced", "options": [
+                {"value": "", "label": "Auto (detect from device)"},
                 {"value": "1", "label": "1"},
                 {"value": "2", "label": "2"},
                 {"value": "3", "label": "3"},

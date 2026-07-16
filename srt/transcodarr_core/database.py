@@ -963,6 +963,10 @@ _BASE_PRESET_SETTINGS = {
     "TARGET_CRF": "",
     "TARGET_AUDIO_NORMALIZE": "true",
     "TARGET_HDR_MODE": "auto",
+    # Encode backend is a property of the quality profile: a "fast" preset can run
+    # on the GPU while a "quality" preset stays on x264. Unavailable hardware falls
+    # back to software per-job, so this is always safe to set.
+    "HW_BACKEND": "software",
     "FFMPEG_THREADS": "1",
     "ENCODER_THREADS": "4",
     "REQUIRE_SUBTITLES": "true",

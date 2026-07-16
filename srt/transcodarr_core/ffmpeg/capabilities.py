@@ -23,6 +23,7 @@ import logging
 import os
 import re
 import subprocess
+import tempfile
 import threading
 import time
 
@@ -142,6 +143,45 @@ def _encodable_codecs(profiles: dict[str, list[str]]) -> set[str]:
 
 def _node_id() -> str:
     return os.environ.get("NODE_ID") or "local"
+
+
+def _ffmpeg_filters() -> set[str]:
+    out = _run(["ffmpeg", "-hide_banner", "-filters"])
+    return set(re.findall(r"^\s*[A-Z.]{3}\s+(\S+)", out, re.MULTILINE))
+
+
+def _detect_tonemappers(filters: set[str], dri_device: str | None) -> list[str]:
+    """
+    GPU HDR->SDR tonemappers usable on this node.
+
+    The filter existing in ffmpeg proves nothing, so this actually runs one. The
+    probe clip must carry HDR10 mastering-display metadata: tonemap_vaapi rejects
+    input without it ("No mastering display data from input"), so probing with a
+    plain testsrc reports a false negative.
+
+    tonemap_opencl is deliberately not offered: the chain that works needs
+    hwaccel-vaapi decode rather than hwupload, which isn't wired up here.
+    """
+    if not dri_device or "tonemap_vaapi" not in filters:
+        return []
+
+    with tempfile.TemporaryDirectory() as td:
+        src = os.path.join(td, "probe.mp4")
+        _run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+              "-f", "lavfi", "-i", "testsrc2=size=64x64:rate=1:duration=1",
+              "-vf", "format=yuv420p10le", "-c:v", "libx265",
+              "-x265-params",
+              "colorprim=bt2020:transfer=smpte2084:colormatrix=bt2020nc:"
+              "master-display=G(8500,39850)B(6550,2300)R(35400,14600)WP(15635,16450)L(10000000,1)",
+              src])
+        if not os.path.exists(src):
+            return []
+        out = _run(["ffmpeg", "-hide_banner", "-loglevel", "error",
+                    "-vaapi_device", dri_device, "-i", src,
+                    "-vf", "format=p010,hwupload,tonemap_vaapi=format=nv12",
+                    "-frames:v", "1", "-f", "null", "-"])
+    ok = not any(m in out for m in ("Error", "Invalid", "Failed", "No mastering"))
+    return ["vaapi"] if ok else []
 
 
 def _software_backend(encoders: set[str]) -> dict:
@@ -275,12 +315,21 @@ def detect_capabilities(force: bool = False) -> dict:
             _software_backend(encoders),
         ]
 
+        # Tonemappers are node-level, not per-backend: they're filters, and they
+        # all run on the same render node.
+        dri = next((b["device"] for b in backends
+                    if b["available"] and b["id"] in ("vaapi", "qsv") and b["device"]), None)
+        tonemappers = _detect_tonemappers(_ffmpeg_filters(), dri)
+
         caps = {
             "node_id": _node_id(),
             "probed_at": time.time(),
             "backends": backends,
             "hardware_available": any(b["available"] and b["id"] != "software" for b in backends),
+            "tonemappers": tonemappers,
         }
+        logging.info("[CAPS] %s: GPU tonemappers: %s",
+                     caps["node_id"], ", ".join(tonemappers) or "none (HDR tonemaps on CPU)")
 
         for b in backends:
             if b["available"]:

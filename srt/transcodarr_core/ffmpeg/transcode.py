@@ -3,7 +3,7 @@ from __future__ import annotations
 import os, subprocess, logging, contextlib, json
 from dataclasses import dataclass
 from ..config import Settings, get_setting
-from ..ffmpeg.probe import get_duration_seconds, ffprobe_json, detect_hdr
+from ..ffmpeg.probe import get_duration_seconds, ffprobe_json, detect_hdr, has_mastering_display
 from ..ffmpeg.limits import backend_of_cmd, hw_slot
 from ..subtitles.sanitize import sanitize_for_movtext
 
@@ -44,6 +44,18 @@ _HW_VIDEO_ENCODER = {
 # is generally less efficient than x264 at the same CRF, so expect to spend a few
 # points to match software quality.
 _HW_QUALITY_FLAG = {"qsv": "-global_quality", "vaapi": "-qp", "nvenc": "-cq"}
+
+# HDR->SDR tonemapping. This is a FILTER, not an encoder setting: it can run on
+# the CPU or the GPU independently of where the encode happens. Measured on a
+# UHD 630 (3s 1080p HDR10, tonemap+encode): software zscale+hable 8.03s,
+# tonemap_vaapi 2.09s, tonemap_opencl 3.27s.
+#
+# The tonemapper must emit frames the encoder can consume, which constrains the
+# pairings: tonemap_vaapi produces VAAPI surfaces and pairs with h264_vaapi;
+# OpenCL maps back to VAAPI. QSV/NVENC would need extra hwmap plumbing, so they
+# use the software tonemap and still get a hardware *encode* — the CPU-tonemap +
+# GPU-encode combination is a real win on its own and works everywhere.
+_TONEMAP_BACKENDS = {"vaapi"}
 
 # x264-style preset names -> NVENC p-levels (p1 fastest .. p7 slowest).
 _NVENC_PRESET_MAP = {
@@ -133,11 +145,12 @@ def _resolve_backend(requested: str | None, codec: str, hdr_action: str,
 
     name = os.path.basename(file_path)
 
-    # HDR stays on software until the hardware tonemap path lands: the tonemap
-    # chain is software (zscale) and passthrough needs 10-bit hardware surfaces.
-    if hdr_action in ("tonemap", "passthrough"):
-        logging.info("[HW] %s: HDR (%s) not supported on %s yet — using software",
-                     name, hdr_action, backend)
+    # HDR passthrough needs 10-bit hardware surfaces end-to-end; not wired up, so
+    # it stays on software. Tonemapping no longer forces software — the tonemap
+    # filter runs on CPU or GPU and the encode is offloaded either way.
+    if hdr_action == "passthrough":
+        logging.info("[HW] %s: HDR passthrough not supported on %s yet — using software",
+                     name, backend)
         return "software", None
 
     if backend not in _HW_VIDEO_ENCODER:
@@ -163,6 +176,72 @@ def _resolve_backend(requested: str | None, codec: str, hdr_action: str,
         return "software", None
 
     return backend, info.get("device")
+
+
+def _resolve_tonemap(requested: str | None, backend: str, file_path: str) -> str:
+    """
+    Pick where HDR->SDR tonemapping runs: "software" | "vaapi".
+
+    Never fails a job — anything unusable falls back to the software chain, which
+    still pairs with a hardware encode.
+    """
+    want = (requested or "auto").lower()
+    name = os.path.basename(file_path)
+
+    if want in ("", "software", "sw"):
+        return "software"
+
+    if backend != "vaapi":
+        # Only a VAAPI encoder consumes tonemap_vaapi's surfaces directly; QSV and
+        # NVENC would need hwmap plumbing that isn't wired up.
+        if want != "auto":
+            logging.info("[TONEMAP] %s: GPU tonemap needs a vaapi encode (backend=%s) — "
+                         "using software tonemap with hardware encode", name, backend)
+        return "software"
+
+    if not _tonemap_usable("vaapi"):
+        if want != "auto":
+            logging.info("[TONEMAP] %s: GPU tonemap unavailable on this host — using software", name)
+        return "software"
+
+    # tonemap_vaapi hard-fails on sources without mastering-display metadata, so
+    # check the actual file rather than discovering it mid-encode.
+    if not has_mastering_display(file_path):
+        logging.info("[TONEMAP] %s: no HDR10 mastering-display metadata — "
+                     "using software tonemap (tonemap_vaapi requires it)", name)
+        return "software"
+
+    return "vaapi"
+
+
+def _tonemap_usable(method: str) -> bool:
+    """Whether this host can actually run the given GPU tonemapper."""
+    try:
+        from .capabilities import detect_capabilities
+        caps = detect_capabilities()
+    except Exception:
+        return False
+    if not caps.get("hardware_available"):
+        return False
+    return method in (caps.get("tonemappers") or [])
+
+
+def _tonemap_device_args(method: str, device: str | None) -> list[str]:
+    """Extra device init a GPU tonemapper needs, ahead of -i. VAAPI reuses the
+    encoder's own -vaapi_device, so nothing extra is required today."""
+    return []
+
+
+def _tonemap_filters(method: str) -> list[str]:
+    """
+    The tonemap chain itself. Input is software frames; output is GPU surfaces the
+    VAAPI encoder can consume.
+    """
+    if method == "vaapi":
+        # Self-tagging: emits bt709 primaries/transfer without extra output flags.
+        return ["format=p010", "hwupload",
+                "tonemap_vaapi=format=nv12:matrix=bt709:primaries=bt709:transfer=bt709"]
+    return []
 
 
 def _hw_device_args(backend: str, device: str | None) -> list[str]:
@@ -290,6 +369,7 @@ def build_ffmpeg_cmd(file_path: str, srt_path: str, out_temp: str, settings=None
     hdr_action = "none"
     enc_backend = "software"
     hw_device: str | None = None
+    tonemap_method = "software"
     if video_mode != "copy":
         hdr_info = detect_hdr(file_path)
         hdr_action = _resolve_hdr_action(hdr_mode, video_codec) if hdr_info["is_hdr"] else "none"
@@ -297,12 +377,17 @@ def build_ffmpeg_cmd(file_path: str, srt_path: str, out_temp: str, settings=None
         enc_backend, hw_device = _resolve_backend(
             requested, (video_codec or "h264").lower(), hdr_action, file_path
         )
+        if hdr_action == "tonemap" and enc_backend != "software":
+            tonemap_method = _resolve_tonemap(_get("TARGET_TONEMAP", "auto"), enc_backend, file_path)
 
     cmd = [
         "ffmpeg", "-y", "-y", "-threads", ffmpeg_threads,
         "-progress", "pipe:1", "-nostats",
     ]
-    cmd += _hw_device_args(enc_backend, hw_device)
+    # A GPU tonemapper brings its own device chain (OpenCL derives from VAAPI);
+    # otherwise the encoder's own device init applies.
+    _tm_dev = _tonemap_device_args(tonemap_method, hw_device)
+    cmd += _tm_dev if _tm_dev else _hw_device_args(enc_backend, hw_device)
     cmd += ["-i", file_path]
     if srt_safe:
         cmd += ["-sub_charenc", "UTF-8", "-i", srt_safe]
@@ -321,7 +406,10 @@ def build_ffmpeg_cmd(file_path: str, srt_path: str, out_temp: str, settings=None
         vf_filters: list[str] = []
 
         # 1. HDR → SDR tone mapping (must come before scaling)
-        if hdr_action == "tonemap":
+        if hdr_action == "tonemap" and tonemap_method != "software":
+            logging.info("[HDR] Tonemapping HDR→SDR on GPU (%s) for %s",
+                         tonemap_method, os.path.basename(file_path))
+        elif hdr_action == "tonemap":
             logging.info("[HDR] Tonemapping HDR→SDR for %s", os.path.basename(file_path))
             vf_filters += [
                 "zscale=t=linear:npl=100",
@@ -350,7 +438,14 @@ def build_ffmpeg_cmd(file_path: str, srt_path: str, out_temp: str, settings=None
         # behaviour is shared with the software path, and encode is the expensive
         # part we're offloading. A full GPU pipeline (hwaccel decode +
         # scale_vaapi) is a later optimisation.
-        upload_filters = _hw_upload_filters(enc_backend)
+        # A GPU tonemapper already leaves frames on the device, so it replaces the
+        # plain hwupload. Scaling stays ahead of it on the CPU — it keeps the
+        # shared aspect-preserving scale=-2:1080 behaviour and means the tonemap
+        # works on 1080p rather than 4K.
+        if tonemap_method != "software":
+            upload_filters = _tonemap_filters(tonemap_method)
+        else:
+            upload_filters = _hw_upload_filters(enc_backend)
         vf_all = vf_filters + upload_filters
         if vf_all:
             cmd += ["-vf", ",".join(vf_all)]

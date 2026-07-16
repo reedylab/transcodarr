@@ -39,10 +39,19 @@ def test_software_requests_resolve_to_software(requested):
     assert _resolve_backend(requested, "h264", "none", "/x.mkv") == ("software", None)
 
 
-@pytest.mark.parametrize("hdr_action", ["tonemap", "passthrough"])
-def test_hdr_falls_back_to_software(hdr_action):
-    """HDR stays on software until the hardware tonemap path lands."""
-    assert _resolve_backend("qsv", "h264", hdr_action, "/x.mkv") == ("software", None)
+def test_hdr_passthrough_falls_back_to_software():
+    """Passthrough needs 10-bit hardware surfaces end-to-end; not wired up."""
+    assert _resolve_backend("qsv", "h264", "passthrough", "/x.mkv") == ("software", None)
+
+
+def test_hdr_tonemap_still_allows_hardware_encode():
+    """
+    Tonemapping is a filter, not an encoder setting — it must not force the whole
+    job onto the CPU. Even when the tonemap runs in software, the encode is still
+    offloaded.
+    """
+    with patch("transcodarr_core.ffmpeg.capabilities.get_backend", return_value=_QSV_OK):
+        assert _resolve_backend("qsv", "h264", "tonemap", "/x.mkv") == ("qsv", "/dev/dri/renderD128")
 
 
 def test_unknown_backend_falls_back():
@@ -201,16 +210,28 @@ def test_hw_scaling_still_applied_before_upload():
     assert vf.startswith("scale=1280:720"), "scale must precede the GPU upload"
 
 
-def test_hw_request_on_hdr_produces_software_command():
+def test_hdr_tonemap_uses_software_filter_but_hardware_encode():
+    """
+    The QSV encoder can't consume tonemap_vaapi surfaces, so the tonemap stays on
+    the CPU — but the encode must still be offloaded. This combination is the
+    baseline win for HDR and works on every backend.
+    """
     with patch("transcodarr_core.ffmpeg.capabilities.get_backend", return_value=_QSV_OK):
         cmd = _build({"TARGET_VIDEO_CODEC": "h264"}, backend="qsv", probe=_HDR)
-    assert "libx264" in cmd
-    assert "h264_qsv" not in cmd
-    assert "-init_hw_device" not in cmd
+    assert "h264_qsv" in cmd, "HDR must not force the encode back to software"
+    assert "libx264" not in cmd
     vf = cmd[cmd.index("-vf") + 1]
-    assert "tonemap=hable:desat=0" in vf
-    assert "format=yuv420p" in vf  # tonemap chain lands back in 8-bit SDR
-    assert "hwupload" not in vf    # nothing should have been staged to the GPU
+    assert "tonemap=hable:desat=0" in vf   # software tonemap chain
+    assert "hwupload" in vf                # ...then staged to the GPU for encode
+
+
+def test_hdr_passthrough_produces_software_command():
+    hdr_passthrough = dict(_HDR)
+    with patch("transcodarr_core.ffmpeg.capabilities.get_backend", return_value=_QSV_OK):
+        # av1 resolves to passthrough under HDR auto handling
+        cmd = _build({"TARGET_VIDEO_CODEC": "av1"}, backend="qsv", probe=hdr_passthrough)
+    assert "libsvtav1" in cmd
+    assert "-init_hw_device" not in cmd
 
 
 def test_video_copy_ignores_backend_entirely():

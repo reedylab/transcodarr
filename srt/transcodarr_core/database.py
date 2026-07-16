@@ -999,6 +999,7 @@ _BASE_PRESET_SETTINGS = {
     # on the GPU while a "quality" preset stays on x264. Unavailable hardware falls
     # back to software per-job, so this is always safe to set.
     "HW_BACKEND": "software",
+    "TARGET_TONEMAP": "auto",
     "FFMPEG_THREADS": "1",
     "ENCODER_THREADS": "4",
     "REQUIRE_SUBTITLES": "true",

@@ -91,6 +91,29 @@ def detect_hdr(path: str) -> dict:
     }
 
 
+def has_mastering_display(path: str) -> bool:
+    """
+    Whether the source carries HDR10 mastering-display metadata.
+
+    tonemap_vaapi hard-fails without it ("No mastering display data from input"),
+    and plenty of HDR files lack it — HLG broadcasts and re-encodes that dropped
+    the SEI. Gating on this keeps a GPU tonemap from killing the job. Reads only
+    the first frame.
+    """
+    try:
+        p = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-show_frames", "-read_intervals", "%+#1",
+             "-show_entries", "frame_side_data=side_data_type",
+             "-of", "default=nw=1", path],
+            capture_output=True, text=True, timeout=20,
+        )
+        return "Mastering display metadata" in (p.stdout or "")
+    except Exception as e:
+        logging.debug("[PROBE] mastering-display check failed for %s: %s", path, e)
+        return False
+
+
 def file_needs_transcode(file_path):
     try:
         target_video_codec = get_setting("TARGET_VIDEO_CODEC", "h264")

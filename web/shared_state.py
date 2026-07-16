@@ -211,6 +211,15 @@ SETTINGS_SCHEMA = {
                 {"value": "vaapi", "label": "VA-API (Intel/AMD)"},
                 {"value": "nvenc", "label": "NVIDIA NVENC"},
             ]},
+            "TARGET_TONEMAP": {"label": "HDR Tonemapping", "type": "select", "group": "video",
+                               "show_if": {"HW_BACKEND": ["qsv", "vaapi", "nvenc"]},
+                               "hint": "Where HDR->SDR conversion runs. GPU is much faster; software gives the best picture. Falls back to software automatically when the GPU can't do it.",
+                               "options": [
+                {"value": "auto", "label": "Auto (GPU if available, else software)"},
+                {"value": "software", "label": "Software (zscale + hable) — best quality"},
+                {"value": "vaapi", "label": "GPU: VA-API"},
+                {"value": "opencl", "label": "GPU: OpenCL"},
+            ]},
             "REQUIRE_SUBTITLES": {"label": "Require Subtitles", "type": "select", "group": "audio", "options": [
                 {"value": "true", "label": "Required (skip if unavailable)"},
                 {"value": "false", "label": "Optional (transcode without if unavailable)"},

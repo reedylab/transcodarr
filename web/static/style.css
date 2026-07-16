@@ -1111,3 +1111,35 @@ th.sort-active{color:var(--accent)}
 .scroll-top-btn:hover { background: var(--accent-2); transform: translateY(-2px); }
 .scroll-top-btn:active { transform: translateY(0); }
 .scroll-top-btn.hidden { opacity: 0; pointer-events: none; transform: translateY(8px); }
+
+/* ---- Transcoding hardware panel (System view) ---- */
+.hw-body{padding:4px 0}
+.hw-row{
+  display:grid;
+  grid-template-columns:18px 1fr auto auto;
+  gap:12px;
+  align-items:center;
+  padding:10px 14px;
+  border-bottom:1px solid var(--border);
+}
+.hw-row:last-child{border-bottom:none}
+.hw-status{font-size:12px;line-height:1}
+.hw-on .hw-status{color:var(--ok)}
+.hw-off .hw-status{color:var(--text-muted)}
+.hw-off .hw-name{color:var(--text-muted)}
+.hw-name{font-size:14px}
+.hw-detail{font-size:12px;color:var(--text-muted);margin-top:2px;word-break:break-word}
+.hw-codecs{display:flex;gap:4px;flex-wrap:wrap}
+.hw-codec{
+  font-size:11px;
+  padding:2px 6px;
+  border-radius:4px;
+  background:var(--bg-hover);
+  border:1px solid var(--border);
+  color:var(--text-muted);
+}
+.hw-sessions{font-size:12px;color:var(--text-muted);white-space:nowrap}
+@media (max-width:700px){
+  .hw-row{grid-template-columns:18px 1fr}
+  .hw-codecs,.hw-sessions{grid-column:2;justify-content:flex-start}
+}

@@ -1,6 +1,7 @@
 # web/routers/settings.py
 from fastapi import APIRouter, Request, Body
 from fastapi.responses import JSONResponse
+import copy
 import json
 import logging
 
@@ -19,6 +20,41 @@ from dotenv import dotenv_values
 router = APIRouter()
 
 
+def _schema_with_hw_availability():
+    """
+    SETTINGS_SCHEMA annotated with the backends this node actually detected.
+
+    Returns a copy — SETTINGS_SCHEMA is module-level shared state and must not be
+    mutated per-request. Without this the picker lists every backend on every
+    host, so choosing NVENC on an Intel box looks like it worked while silently
+    falling back to software.
+    """
+    schema = copy.deepcopy(SETTINGS_SCHEMA)
+    try:
+        from transcodarr_core.ffmpeg.capabilities import detect_capabilities
+        backends = {b["id"]: b for b in detect_capabilities()["backends"]}
+    except Exception as e:
+        logging.debug("[SETTINGS] capability annotation skipped: %s", e)
+        return schema
+
+    for section in schema.values():
+        field = section.get("fields", {}).get("HW_BACKEND")
+        if not field:
+            continue
+        for opt in field.get("options", []):
+            b = backends.get(opt["value"])
+            if not b or opt["value"] == "software":
+                continue
+            if b["available"]:
+                codecs = ", ".join(b.get("codecs") or [])
+                opt["label"] += f" — detected{f' ({codecs})' if codecs else ''}"
+            else:
+                opt["label"] += " — not detected on this host"
+                opt["disabled"] = True
+        break
+    return schema
+
+
 @router.get("/settings")
 def api_get_settings(request: Request):
     """Return all settings with schema for UI rendering."""
@@ -26,7 +62,8 @@ def api_get_settings(request: Request):
         db_values = get_all_settings()
         s = request.app.state.settings
 
-        result = {"schema": SETTINGS_SCHEMA, "values": {}, "encoding_presets": [], "active_preset_id": None}
+        result = {"schema": _schema_with_hw_availability(), "values": {},
+                  "encoding_presets": [], "active_preset_id": None}
 
         for section_key, section in SETTINGS_SCHEMA.items():
             for field_key in section["fields"]:

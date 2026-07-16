@@ -4,7 +4,7 @@ import os, subprocess, logging, contextlib, json
 from dataclasses import dataclass
 from ..config import Settings, get_setting
 from ..ffmpeg.probe import get_duration_seconds, ffprobe_json, detect_hdr
-from ..ffmpeg.limits import hw_slot
+from ..ffmpeg.limits import backend_of_cmd, hw_slot
 from ..subtitles.sanitize import sanitize_for_movtext
 
 @dataclass
@@ -514,12 +514,26 @@ def run_ffmpeg(file_path: str, srt_path: str, out_path: str, base_name: str, s: 
     total_size_gb = bytes_to_gb(os.path.getsize(file_path))
 
     def _log_progress(cmd: list[str]):
+        # Announce what's actually driving the encode. Read from the built command,
+        # not the requested backend — a hardware request may have degraded to
+        # software, and the logs should show what really ran.
+        encoder = cmd[cmd.index("-c:v") + 1] if "-c:v" in cmd else "?"
+        backend = backend_of_cmd(cmd)
+        if backend == "software":
+            tag = "SW"
+            logging.info("[ENCODE] %s — software (%s)", base_name, encoder)
+        else:
+            tag = backend.upper()
+            device = cmd[cmd.index("-vaapi_device") + 1] if "-vaapi_device" in cmd else None
+            logging.info("[ENCODE] %s — HARDWARE %s (%s)%s", base_name, tag, encoder,
+                         f" on {device}" if device else "")
+
         last_logged = -1.0
         for prog in run_ffmpeg_with_progress(cmd, total_duration, progress_file, source_path=file_path, register_path=register_path):
             if abs(prog.percent - last_logged) >= 0.0001 and prog.percent <= 1.0:
                 bar = format_progress_bar(prog.percent)
                 logging.info(
-                    f"[TRANSCODING] {base_name} {bar} {prog.percent * 100:6.2f}%  "
+                    f"[TRANSCODING] [{tag}] {base_name} {bar} {prog.percent * 100:6.2f}%  "
                     f"[{total_size_gb * prog.percent:.2f} GB / {total_size_gb:.2f} GB]"
                 )
                 last_logged = prog.percent

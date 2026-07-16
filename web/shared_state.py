@@ -201,11 +201,15 @@ SETTINGS_SCHEMA = {
                 {"value": "tonemap", "label": "Tonemap to SDR (always)"},
                 {"value": "passthrough", "label": "Passthrough HDR (always)"},
             ]},
-            "HW_BACKEND": {"label": "Encode Backend", "type": "select", "group": "video", "options": [
-                {"value": "software", "label": "Software (libx264/x265) — best quality per bitrate"},
-                {"value": "qsv", "label": "Intel Quick Sync (QSV) — hardware"},
-                {"value": "vaapi", "label": "VA-API (Intel/AMD) — hardware"},
-                {"value": "nvenc", "label": "NVIDIA NVENC — hardware"},
+            # Option labels get annotated with what this host actually detected —
+            # see _schema_with_hw_availability() in routers/settings.py.
+            "HW_BACKEND": {"label": "Encode Backend", "type": "select", "group": "video",
+                           "hint": "Hardware is far faster; software gives the best quality per bitrate. Unavailable backends fall back to software automatically.",
+                           "options": [
+                {"value": "software", "label": "Software (libx264/x265)"},
+                {"value": "qsv", "label": "Intel Quick Sync (QSV)"},
+                {"value": "vaapi", "label": "VA-API (Intel/AMD)"},
+                {"value": "nvenc", "label": "NVIDIA NVENC"},
             ]},
             "REQUIRE_SUBTITLES": {"label": "Require Subtitles", "type": "select", "group": "audio", "options": [
                 {"value": "true", "label": "Required (skip if unavailable)"},

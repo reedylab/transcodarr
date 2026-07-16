@@ -2312,7 +2312,7 @@ function _updateSelectAllBanner(type) { /* no-op until kickoff installs real imp
 
     if (isSelect) {
       const optionsHtml = (field.options || []).map(opt =>
-        `<option value="${escapeHtml(opt.value)}"${opt.value === value ? " selected" : ""}>${escapeHtml(opt.label)}</option>`
+        `<option value="${escapeHtml(opt.value)}"${opt.value === value ? " selected" : ""}${opt.disabled && opt.value !== value ? " disabled" : ""}>${escapeHtml(opt.label)}</option>`
       ).join("");
 
       fieldEl.innerHTML = `
@@ -3446,6 +3446,55 @@ function _updateSelectAllBanner(type) { /* no-op until kickoff installs real imp
     } catch {}
   }
 
+  // ----- Transcoding hardware capabilities -----
+  let hwCaps = null;
+
+  async function loadHwCapabilities(refresh = false) {
+    const body = $("#hw-body");
+    if (!body) return;
+    try {
+      const r = await fetch(`${API}/system/capabilities${refresh ? "?refresh=1" : ""}`, {cache:"no-store"});
+      if (!r.ok) return;
+      hwCaps = await r.json();
+      renderHwCapabilities();
+    } catch {}
+  }
+
+  function renderHwCapabilities() {
+    const body = $("#hw-body");
+    if (!body || !hwCaps) return;
+
+    const note = $("#hw-cap-note");
+    if (note) {
+      note.textContent = hwCaps.hardware_available
+        ? `node: ${hwCaps.node_id}`
+        : `node: ${hwCaps.node_id} — no hardware detected, encoding on CPU`;
+    }
+
+    body.innerHTML = (hwCaps.backends || []).map(b => {
+      const ok = b.available;
+      // An unavailable backend's reason is the actionable part — surface it rather
+      // than just greying the row out.
+      const detail = ok
+        ? [b.device, b.driver].filter(Boolean).join(" · ")
+        : (b.reason || "unavailable");
+      const codecs = ok && b.codecs && b.codecs.length
+        ? b.codecs.map(c => `<span class="hw-codec">${escapeHtml(c)}</span>`).join("")
+        : "";
+      const sessions = ok && b.max_sessions ? `max ${b.max_sessions} concurrent` : "";
+      return `
+        <div class="hw-row${ok ? " hw-on" : " hw-off"}">
+          <div class="hw-status">${ok ? "●" : "○"}</div>
+          <div class="hw-main">
+            <div class="hw-name">${escapeHtml(b.label || b.id)}</div>
+            <div class="hw-detail">${escapeHtml(detail)}</div>
+          </div>
+          <div class="hw-codecs">${codecs}</div>
+          <div class="hw-sessions">${escapeHtml(sessions)}</div>
+        </div>`;
+    }).join("");
+  }
+
   async function loadStorageHistory() {
     if (!statsViewActive) return;
     try {
@@ -3879,10 +3928,26 @@ function _updateSelectAllBanner(type) { /* no-op until kickoff installs real imp
       statsViewActive = true;
       updateSystemStats();
       loadStorageHistory();
+      // Capabilities are a cached probe server-side, so fetch once per view entry
+      // rather than on the stats poll interval.
+      if (!hwCaps) loadHwCapabilities();
     } else if (!isVisible) {
       statsViewActive = false;
     }
   }
+
+  // Re-detect is the entry point after attaching a GPU without restarting.
+  document.addEventListener("click", (e) => {
+    const btn = e.target.closest("#hw-refresh");
+    if (!btn) return;
+    btn.disabled = true;
+    const prev = btn.textContent;
+    btn.textContent = "Detecting…";
+    loadHwCapabilities(true).finally(() => {
+      btn.disabled = false;
+      btn.textContent = prev;
+    });
+  });
 
   // Hook into nav clicks to detect stats view
   $$(".nav-item").forEach(b => {

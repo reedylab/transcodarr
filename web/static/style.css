@@ -1113,6 +1113,15 @@ th.sort-active{color:var(--accent)}
 .scroll-top-btn.hidden { opacity: 0; pointer-events: none; transform: translateY(8px); }
 
 /* ---- Transcoding hardware panel (System view) ---- */
+/* #view-stats is a fixed-height flex column sized to the viewport with
+   overflow:hidden, built when it held exactly two blocks (stats grid + a
+   storage panel that flexed to fill the rest). A third panel has nowhere to go,
+   so the storage chart got squeezed to a sliver. Let the view scroll and stop
+   the panels shrinking below a usable size. */
+#view-stats{overflow-y:auto}
+#view-stats #storage-panel{flex:1 0 auto;min-height:300px}
+#view-stats #hw-panel{flex:0 0 auto}
+
 .hw-body{padding:4px 0}
 .hw-row{
   display:grid;

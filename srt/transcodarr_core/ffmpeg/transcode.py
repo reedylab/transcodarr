@@ -55,7 +55,7 @@ _HW_QUALITY_FLAG = {"qsv": "-global_quality", "vaapi": "-qp", "nvenc": "-cq"}
 # OpenCL maps back to VAAPI. QSV/NVENC would need extra hwmap plumbing, so they
 # use the software tonemap and still get a hardware *encode* — the CPU-tonemap +
 # GPU-encode combination is a real win on its own and works everywhere.
-_TONEMAP_BACKENDS = {"vaapi"}
+_TONEMAP_BACKENDS = {"vaapi", "opencl"}
 
 # x264-style preset names -> NVENC p-levels (p1 fastest .. p7 slowest).
 _NVENC_PRESET_MAP = {
@@ -199,19 +199,34 @@ def _resolve_tonemap(requested: str | None, backend: str, file_path: str) -> str
                          "using software tonemap with hardware encode", name, backend)
         return "software"
 
-    if not _tonemap_usable("vaapi"):
-        if want != "auto":
-            logging.info("[TONEMAP] %s: GPU tonemap unavailable on this host — using software", name)
+    # tonemap_vaapi is ~4x faster than OpenCL here but hard-fails on sources with
+    # no HDR10 mastering-display metadata; OpenCL handles those. So the file
+    # decides, not just the host.
+    has_md = has_mastering_display(file_path)
+
+    if want == "vaapi":
+        if _tonemap_usable("vaapi") and has_md:
+            return "vaapi"
+        logging.info("[TONEMAP] %s: vaapi tonemap unusable (%s) — using software", name,
+                     "no mastering-display metadata" if _tonemap_usable("vaapi") else "unavailable")
         return "software"
 
-    # tonemap_vaapi hard-fails on sources without mastering-display metadata, so
-    # check the actual file rather than discovering it mid-encode.
-    if not has_mastering_display(file_path):
-        logging.info("[TONEMAP] %s: no HDR10 mastering-display metadata — "
-                     "using software tonemap (tonemap_vaapi requires it)", name)
+    if want == "opencl":
+        if _tonemap_usable("opencl"):
+            return "opencl"
+        logging.info("[TONEMAP] %s: opencl tonemap unavailable — using software", name)
         return "software"
 
-    return "vaapi"
+    # auto: fastest first, then whatever still works for this file.
+    if has_md and _tonemap_usable("vaapi"):
+        return "vaapi"
+    if _tonemap_usable("opencl"):
+        if not has_md:
+            logging.info("[TONEMAP] %s: no mastering-display metadata — using opencl "
+                         "(tonemap_vaapi requires it)", name)
+        return "opencl"
+    logging.info("[TONEMAP] %s: no usable GPU tonemapper — using software", name)
+    return "software"
 
 
 def _tonemap_usable(method: str) -> bool:
@@ -227,8 +242,16 @@ def _tonemap_usable(method: str) -> bool:
 
 
 def _tonemap_device_args(method: str, device: str | None) -> list[str]:
-    """Extra device init a GPU tonemapper needs, ahead of -i. VAAPI reuses the
-    encoder's own -vaapi_device, so nothing extra is required today."""
+    """
+    Extra device init a GPU tonemapper needs, ahead of -i.
+
+    VAAPI reuses the encoder's own -vaapi_device. OpenCL derives from a VAAPI
+    parent so frames can hwmap back for the encoder, and that VAAPI device also
+    serves h264_vaapi — so these args replace the encoder's own device init.
+    """
+    if method == "opencl" and device:
+        return ["-init_hw_device", f"vaapi=va:{device}",
+                "-init_hw_device", "opencl=ocl@va", "-filter_hw_device", "ocl"]
     return []
 
 
@@ -241,6 +264,14 @@ def _tonemap_filters(method: str) -> list[str]:
         # Self-tagging: emits bt709 primaries/transfer without extra output flags.
         return ["format=p010", "hwupload",
                 "tonemap_vaapi=format=nv12:matrix=bt709:primaries=bt709:transfer=bt709"]
+    if method == "opencl":
+        # hwupload lands straight on the OpenCL device (-filter_hw_device ocl);
+        # an extra hwmap=derive_device=opencl here double-maps and breaks it.
+        # hable matches the software chain's operator. Unlike tonemap_vaapi this
+        # does NOT tag its output — the caller must force bt709.
+        return ["format=p010", "hwupload",
+                "tonemap_opencl=tonemap=hable:desat=0:format=nv12",
+                "hwmap=derive_device=vaapi:reverse=1"]
     return []
 
 
@@ -459,6 +490,12 @@ def build_ffmpeg_cmd(file_path: str, srt_path: str, out_temp: str, settings=None
                 cmd += ["-pix_fmt", "yuv420p10le"]
             elif hdr_action == "none":
                 cmd += ["-pix_fmt", "yuv420p"]
+
+        # tonemap_opencl does not tag its output; without this the file carries SDR
+        # pixels labelled with the source's BT.2020 transfer and players render it
+        # wrong. tonemap_vaapi tags itself.
+        if tonemap_method == "opencl":
+            cmd += ["-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709"]
 
         if enc_backend == "software":
             cmd += _video_encoder_args(video_codec, preset, profile, crf, encoder_threads)

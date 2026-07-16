@@ -18,6 +18,8 @@ RUN sed -i 's/^Components: main$/Components: main contrib non-free non-free-firm
         intel-media-va-driver-non-free \
         i965-va-driver \
         mesa-va-drivers \
+        intel-opencl-icd \
+        mesa-opencl-icd \
         vainfo && \
     rm -rf /var/lib/apt/lists/*
 

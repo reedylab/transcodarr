@@ -213,12 +213,12 @@ SETTINGS_SCHEMA = {
             ]},
             "TARGET_TONEMAP": {"label": "HDR Tonemapping", "type": "select", "group": "video",
                                "show_if": {"HW_BACKEND": ["qsv", "vaapi", "nvenc"]},
-                               "hint": "Where HDR->SDR conversion runs. GPU is much faster; software gives the best picture. Falls back to software automatically when the GPU can't do it.",
+                               "hint": "Where HDR->SDR conversion runs. Auto picks the fastest that works for each file: VA-API when the source carries HDR10 mastering-display metadata, else OpenCL. Falls back to software automatically. Needs a VA-API encode backend.",
                                "options": [
                 {"value": "auto", "label": "Auto (GPU if available, else software)"},
                 {"value": "software", "label": "Software (zscale + hable) — best quality"},
-                {"value": "vaapi", "label": "GPU: VA-API"},
-                {"value": "opencl", "label": "GPU: OpenCL"},
+                {"value": "vaapi", "label": "GPU: VA-API (fastest; needs HDR10 mastering-display metadata)"},
+                {"value": "opencl", "label": "GPU: OpenCL (slower; works on any HDR source)"},
             ]},
             "REQUIRE_SUBTITLES": {"label": "Require Subtitles", "type": "select", "group": "audio", "options": [
                 {"value": "true", "label": "Required (skip if unavailable)"},

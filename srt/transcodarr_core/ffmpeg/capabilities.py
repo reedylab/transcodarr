@@ -152,19 +152,21 @@ def _ffmpeg_filters() -> set[str]:
 
 def _detect_tonemappers(filters: set[str], dri_device: str | None) -> list[str]:
     """
-    GPU HDR->SDR tonemappers usable on this node.
+    GPU HDR->SDR tonemappers usable on this node, fastest first.
 
-    The filter existing in ffmpeg proves nothing, so this actually runs one. The
-    probe clip must carry HDR10 mastering-display metadata: tonemap_vaapi rejects
-    input without it ("No mastering display data from input"), so probing with a
-    plain testsrc reports a false negative.
+    The filter existing in ffmpeg proves nothing — tonemap_opencl ships on every
+    build but needs an OpenCL ICD, and tonemap_vaapi needs driver VPP support. So
+    each is actually run once.
 
-    tonemap_opencl is deliberately not offered: the chain that works needs
-    hwaccel-vaapi decode rather than hwupload, which isn't wired up here.
+    The probe clip must carry HDR10 mastering-display metadata: tonemap_vaapi
+    rejects input without it, so probing with a plain testsrc reports a false
+    negative. (tonemap_opencl accepts either, which is why it stays in the list
+    even though it measured ~4x slower than vaapi on Gen9.5.)
     """
-    if not dri_device or "tonemap_vaapi" not in filters:
+    if not dri_device:
         return []
 
+    found: list[str] = []
     with tempfile.TemporaryDirectory() as td:
         src = os.path.join(td, "probe.mp4")
         _run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
@@ -176,12 +178,32 @@ def _detect_tonemappers(filters: set[str], dri_device: str | None) -> list[str]:
               src])
         if not os.path.exists(src):
             return []
-        out = _run(["ffmpeg", "-hide_banner", "-loglevel", "error",
-                    "-vaapi_device", dri_device, "-i", src,
-                    "-vf", "format=p010,hwupload,tonemap_vaapi=format=nv12",
-                    "-frames:v", "1", "-f", "null", "-"])
-    ok = not any(m in out for m in ("Error", "Invalid", "Failed", "No mastering"))
-    return ["vaapi"] if ok else []
+
+        if "tonemap_vaapi" in filters:
+            out = _run(["ffmpeg", "-hide_banner", "-loglevel", "error",
+                        "-vaapi_device", dri_device, "-i", src,
+                        "-vf", "format=p010,hwupload,tonemap_vaapi=format=nv12",
+                        "-c:v", "h264_vaapi", "-frames:v", "1", "-f", "null", "-"])
+            if not _probe_failed(out):
+                found.append("vaapi")
+
+        if "tonemap_opencl" in filters:
+            out = _run(["ffmpeg", "-hide_banner", "-loglevel", "error",
+                        "-init_hw_device", f"vaapi=va:{dri_device}",
+                        "-init_hw_device", "opencl=ocl@va", "-filter_hw_device", "ocl",
+                        "-i", src,
+                        "-vf", "format=p010,hwupload,"
+                               "tonemap_opencl=tonemap=hable:desat=0:format=nv12,"
+                               "hwmap=derive_device=vaapi:reverse=1",
+                        "-c:v", "h264_vaapi", "-frames:v", "1", "-f", "null", "-"])
+            if not _probe_failed(out):
+                found.append("opencl")
+
+    return found
+
+
+def _probe_failed(out: str) -> bool:
+    return any(m in out for m in ("Error", "Invalid", "Failed", "No mastering", "failed"))
 
 
 def _software_backend(encoders: set[str]) -> dict:

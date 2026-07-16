@@ -976,6 +976,20 @@ DEFAULT_PRESETS = [
     {"name": "Audio Only", "settings": {**_BASE_PRESET_SETTINGS, "VIDEO_STREAM_MODE": "copy"}},
     {"name": "Remux + Subs", "settings": {**_BASE_PRESET_SETTINGS, "VIDEO_STREAM_MODE": "copy", "AUDIO_STREAM_MODE": "copy"}},
     {"name": "4K Downscale", "settings": {**_BASE_PRESET_SETTINGS, "TARGET_RESOLUTION": "1080p_max"}},
+    # Hardware twin of "4K Downscale", so an Auto rule can target either one.
+    # HW_BACKEND=auto keeps it portable — it resolves to whatever GPU the host has
+    # (Intel/AMD/NVIDIA) and to software when there is none, so this preset is safe
+    # to ship to every user rather than naming a vendor.
+    # TARGET_CRF is explicit ON PURPOSE: "" means CRF 23 to libx264, but hardware
+    # encoders read it as "no quality target" and drop into a default bitrate mode.
+    # Measured on a UHD 630, h264_qsv with no quality flag scored SSIM 0.966 in a
+    # 0.11 MB file vs 0.983 / 0.75 MB at global_quality 23 — a real quality loss.
+    {"name": "4K Downscale (Hardware)", "settings": {
+        **_BASE_PRESET_SETTINGS,
+        "TARGET_RESOLUTION": "1080p_max",
+        "HW_BACKEND": "auto",
+        "TARGET_CRF": "23",
+    }},
     {"name": "High Quality", "settings": {**_BASE_PRESET_SETTINGS, "TARGET_PRESET": "slow", "TARGET_CRF": "19"}},
 ]
 

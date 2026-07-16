@@ -133,6 +133,22 @@ def _resolve_backend(requested: str | None, codec: str, hdr_action: str,
 
     name = os.path.basename(file_path)
 
+    # "auto" lets a shipped preset be portable: pick whatever hardware this host
+    # actually has (Intel/AMD/NVIDIA), else software. Without it a default preset
+    # would have to name a vendor and be wrong for most users.
+    if backend == "auto":
+        try:
+            from .capabilities import available_backends
+            hw = [b for b in available_backends() if b != "software"]
+        except Exception as e:
+            logging.warning("[HW] auto-detect failed (%s) — using software", e)
+            return "software", None
+        if not hw:
+            logging.info("[HW] %s: auto — no hardware detected, using software", name)
+            return "software", None
+        backend = hw[0]
+        logging.debug("[HW] auto selected %s", backend)
+
     # HDR stays on software until the hardware tonemap path lands: the tonemap
     # chain is software (zscale) and passthrough needs 10-bit hardware surfaces.
     if hdr_action in ("tonemap", "passthrough"):

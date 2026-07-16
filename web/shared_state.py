@@ -207,6 +207,7 @@ SETTINGS_SCHEMA = {
                            "hint": "Hardware is far faster; software gives the best quality per bitrate. Unavailable backends fall back to software automatically.",
                            "options": [
                 {"value": "software", "label": "Software (libx264/x265)"},
+                {"value": "auto", "label": "Auto (any detected GPU, else software)"},
                 {"value": "qsv", "label": "Intel Quick Sync (QSV)"},
                 {"value": "vaapi", "label": "VA-API (Intel/AMD)"},
                 {"value": "nvenc", "label": "NVIDIA NVENC"},

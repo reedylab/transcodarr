@@ -299,6 +299,38 @@ def _run_migrations(conn):
     # Migration: Index transcode_history.source_path for fast circuit-breaker lookups.
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_transcode_source ON transcode_history(source_path)")
 
+    # Migration: Backfill HW_BACKEND on presets that predate the key.
+    # Without it those presets carry no backend, so the encoder falls through to
+    # the global setting and the UI leaves whatever the previously-selected preset
+    # had in the field — a software preset can silently inherit hardware. Every
+    # preset must state its own backend.
+    cursor.execute("""
+        UPDATE encoding_presets
+           SET settings = settings || '{"HW_BACKEND": "software"}'::jsonb
+         WHERE settings IS NOT NULL AND NOT (settings ? 'HW_BACKEND')
+    """)
+    if cursor.rowcount:
+        logging.info("[DATABASE] Migration: Backfilled HW_BACKEND=software on %d preset(s)", cursor.rowcount)
+
+    # Migration: Add the hardware preset to existing installs. Seeding only runs on
+    # an empty table, so without this nobody who already has presets would ever get
+    # it. Additive only — never touches presets the user already has, and is skipped
+    # entirely on hosts with no hardware encoder (a "(Hardware)" preset pinned to
+    # software would be a lie).
+    cursor.execute("SELECT 1 FROM encoding_presets WHERE name = %s", ("4K Downscale (Hardware)",))
+    if not cursor.fetchone():
+        _hw = _detected_hw_backend()
+        if _hw:
+            _tmpl = next((p for p in DEFAULT_PRESETS if p["name"] == "4K Downscale (Hardware)"), None)
+            if _tmpl:
+                cursor.execute(
+                    "INSERT INTO encoding_presets (name, is_default, settings) VALUES (%s, TRUE, %s)",
+                    (_tmpl["name"], Json({**_tmpl["settings"], "HW_BACKEND": _hw})),
+                )
+                logging.info("[DATABASE] Migration: Added '4K Downscale (Hardware)' preset (backend=%s)", _hw)
+        else:
+            logging.debug("[DATABASE] No hardware encoder detected — hardware preset not added")
+
     cursor.close()
     conn.commit()
 
@@ -977,9 +1009,10 @@ DEFAULT_PRESETS = [
     {"name": "Remux + Subs", "settings": {**_BASE_PRESET_SETTINGS, "VIDEO_STREAM_MODE": "copy", "AUDIO_STREAM_MODE": "copy"}},
     {"name": "4K Downscale", "settings": {**_BASE_PRESET_SETTINGS, "TARGET_RESOLUTION": "1080p_max"}},
     # Hardware twin of "4K Downscale", so an Auto rule can target either one.
-    # HW_BACKEND=auto keeps it portable — it resolves to whatever GPU the host has
-    # (Intel/AMD/NVIDIA) and to software when there is none, so this preset is safe
-    # to ship to every user rather than naming a vendor.
+    # HW_BACKEND is filled in at seed time with the backend actually detected on
+    # this host (see _seed_hardware_preset) rather than a vendor guess or an
+    # "auto" that resolves invisibly at encode time — the preset should always
+    # state exactly what will run.
     # TARGET_CRF is explicit ON PURPOSE: "" means CRF 23 to libx264, but hardware
     # encoders read it as "no quality target" and drop into a default bitrate mode.
     # Measured on a UHD 630, h264_qsv with no quality flag scored SSIM 0.966 in a
@@ -987,7 +1020,7 @@ DEFAULT_PRESETS = [
     {"name": "4K Downscale (Hardware)", "settings": {
         **_BASE_PRESET_SETTINGS,
         "TARGET_RESOLUTION": "1080p_max",
-        "HW_BACKEND": "auto",
+        "HW_BACKEND": "qsv",  # replaced at seed time by whatever this host has
         "TARGET_CRF": "23",
     }},
     {"name": "High Quality", "settings": {**_BASE_PRESET_SETTINGS, "TARGET_PRESET": "slow", "TARGET_CRF": "19"}},
@@ -1018,17 +1051,44 @@ _AUTO_RULE_PRESET_MAP = {
 _AUTO_FALLBACK_PRESET = "Audio Only"
 
 
+def _detected_hw_backend() -> str | None:
+    """The hardware backend this host actually has, or None if it has none."""
+    try:
+        from .ffmpeg.capabilities import available_backends
+        hw = [b for b in available_backends() if b != "software"]
+        return hw[0] if hw else None
+    except Exception as e:
+        logging.debug("[DATABASE] hardware probe during seed failed: %s", e)
+        return None
+
+
 def _seed_default_presets(cursor):
     """Insert default presets if table is empty."""
     cursor.execute("SELECT COUNT(*) FROM encoding_presets")
     if cursor.fetchone()[0] > 0:
         return
+
+    # Resolve the hardware preset's backend once, here, so the stored preset names
+    # a real backend instead of a vendor guess or an "auto" that resolves
+    # invisibly per job. On a host with no GPU the preset would be a lie, so it is
+    # simply not created — the System tab shows what was detected, and a user who
+    # adds a GPU later can create it.
+    detected = _detected_hw_backend()
     for p in DEFAULT_PRESETS:
+        settings = p["settings"]
+        if settings.get("HW_BACKEND") not in (None, "", "software"):
+            if not detected:
+                logging.info("[DATABASE] Skipping preset %r — no hardware encoder detected", p["name"])
+                continue
+            settings = {**settings, "HW_BACKEND": detected}
         cursor.execute(
             "INSERT INTO encoding_presets (name, is_default, settings) VALUES (%s, TRUE, %s)",
-            (p["name"], Json(p["settings"])),
+            (p["name"], Json(settings)),
         )
-    logging.info("[DATABASE] Seeded %d default encoding presets", len(DEFAULT_PRESETS))
+    if detected:
+        logging.info("[DATABASE] Seeded default presets (hardware preset pinned to %r)", detected)
+    else:
+        logging.info("[DATABASE] Seeded default presets (no hardware encoder detected)")
     _seed_auto_preset(cursor)
 
 

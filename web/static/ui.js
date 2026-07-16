@@ -2056,7 +2056,7 @@ function _updateSelectAllBanner(type) { /* no-op until kickoff installs real imp
     fieldsDiv.className = "settings-fields";
 
     for (const [fieldKey, field] of Object.entries(section.fields)) {
-      renderSettingField(fieldsDiv, fieldKey, field);
+      if (fieldApplies(field)) renderSettingField(fieldsDiv, fieldKey, field);
     }
 
     container.appendChild(fieldsDiv);
@@ -2091,7 +2091,7 @@ function _updateSelectAllBanner(type) { /* no-op until kickoff installs real imp
       const fieldsDiv = document.createElement("div");
       fieldsDiv.className = "settings-fields";
       for (const [fieldKey, field] of Object.entries(section.fields)) {
-        if (field.group === groupKey) {
+        if (field.group === groupKey && fieldApplies(field)) {
           renderSettingField(fieldsDiv, fieldKey, field);
         }
       }
@@ -2198,7 +2198,7 @@ function _updateSelectAllBanner(type) { /* no-op until kickoff installs real imp
     const fieldsContainer = modal.querySelector(".integration-modal-fields");
     for (const fieldKey of card.fields) {
       const field = section.fields[fieldKey];
-      if (field) renderSettingField(fieldsContainer, fieldKey, field);
+      if (field && fieldApplies(field)) renderSettingField(fieldsContainer, fieldKey, field);
     }
 
     // Render webhook controls if applicable
@@ -2300,6 +2300,32 @@ function _updateSelectAllBanner(type) { /* no-op until kickoff installs real imp
     // Re-attach listeners after innerHTML replacement — handled inline above
   }
 
+  // A field may declare the values of another field it's relevant for, e.g. encoder
+  // threads do nothing once the GPU is encoding, and VAAPI has no preset knob.
+  // Hiding them keeps a hardware preset from showing software-only settings that
+  // would silently do nothing.
+  function fieldApplies(field) {
+    if (!field || !field.show_if) return true;
+    return Object.entries(field.show_if).every(([key, allowed]) => {
+      const cur = (settingsModified[key] ?? settingsOriginal[key] ?? "");
+      return Array.isArray(allowed) ? allowed.includes(cur) : allowed === cur;
+    });
+  }
+
+  // Keys that other fields' visibility depends on — changing one re-renders the
+  // section so the form reshapes immediately.
+  function settingsDependencyKeys() {
+    const keys = new Set();
+    const scan = fields => Object.values(fields || {}).forEach(f => {
+      if (f && f.show_if) Object.keys(f.show_if).forEach(k => keys.add(k));
+    });
+    for (const section of Object.values(settingsSchema || {})) {
+      scan(section.fields);
+      Object.values(section.groups || {}).forEach(g => scan(g.fields));
+    }
+    return keys;
+  }
+
   function renderSettingField(parent, fieldKey, field) {
     const value = settingsModified[fieldKey] || "";
     const isModified = settingsModified[fieldKey] !== settingsOriginal[fieldKey];
@@ -2326,6 +2352,11 @@ function _updateSelectAllBanner(type) { /* no-op until kickoff installs real imp
       const select = fieldEl.querySelector("select");
       select.addEventListener("change", (e) => {
         settingsModified[fieldKey] = e.target.value;
+        // Reshape the form when this field gates others (e.g. Encode Backend).
+        if (settingsDependencyKeys().has(fieldKey)) {
+          showSettingsSection(currentSection);
+          return;
+        }
         updateSettingsUI();
       });
     } else {
@@ -2422,6 +2453,9 @@ function _updateSelectAllBanner(type) { /* no-op until kickoff installs real imp
   function renderEncodingFields(container, section) {
     const groups = {video: [], audio: [], advanced: []};
     for (const [fieldKey, field] of Object.entries(section.fields)) {
+      // Skip settings that don't apply to this preset's backend — a hardware
+      // preset showing "Encoder Threads" implies a knob that does nothing.
+      if (!fieldApplies(field)) continue;
       const group = field.group || "advanced";
       if (groups[group]) groups[group].push([fieldKey, field]);
     }

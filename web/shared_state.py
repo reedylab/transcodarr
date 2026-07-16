@@ -130,8 +130,8 @@ SETTINGS_SCHEMA = {
                 {"value": "copy", "label": "Copy (passthrough)"},
             ]},
             "TARGET_VIDEO_CODEC": {"label": "Video Codec", "type": "select", "group": "video", "options": [
-                {"value": "h264", "label": "H.264 (x264)"},
-                {"value": "h265", "label": "H.265 (x265)"},
+                {"value": "h264", "label": "H.264 / AVC"},
+                {"value": "h265", "label": "H.265 / HEVC"},
                 {"value": "vp9", "label": "VP9"},
                 {"value": "av1", "label": "AV1"},
             ]},
@@ -155,7 +155,7 @@ SETTINGS_SCHEMA = {
                 {"value": "2560x1440", "label": "1440p (2560x1440)"},
                 {"value": "3840x2160", "label": "4K (3840x2160)"},
             ]},
-            "TARGET_PRESET": {"label": "Preset", "type": "select", "group": "video", "options": [
+            "TARGET_PRESET": {"label": "Preset", "show_if": {"HW_BACKEND": ["", "software", "qsv", "nvenc"]}, "type": "select", "group": "video", "options": [
                 {"value": "ultrafast", "label": "Ultrafast"},
                 {"value": "superfast", "label": "Superfast"},
                 {"value": "veryfast", "label": "Veryfast"},
@@ -183,11 +183,11 @@ SETTINGS_SCHEMA = {
                 {"value": "6", "label": "6 (5.1)"},
                 {"value": "8", "label": "8 (7.1)"},
             ]},
-            "TARGET_CRF": {"label": "CRF", "type": "select", "group": "video", "options": [
+            "TARGET_CRF": {"label": "Quality (CRF / QP)", "hint": "Lower = better. Software uses CRF; hardware maps it to global_quality (QSV), qp (VAAPI) or cq (NVENC). Leave blank ONLY on software — hardware reads blank as no quality target and drops to a poor default bitrate.", "type": "select", "group": "video", "options": [
                 {"value": "", "label": "Default (codec decides)"},
                 {"value": "18", "label": "18 (Visually Lossless)"},
                 {"value": "20", "label": "20"},
-                {"value": "23", "label": "23 (x264 Default)"},
+                {"value": "23", "label": "23 (default)"},
                 {"value": "26", "label": "26"},
                 {"value": "28", "label": "28"},
                 {"value": "30", "label": "30"},
@@ -207,7 +207,6 @@ SETTINGS_SCHEMA = {
                            "hint": "Hardware is far faster; software gives the best quality per bitrate. Unavailable backends fall back to software automatically.",
                            "options": [
                 {"value": "software", "label": "Software (libx264/x265)"},
-                {"value": "auto", "label": "Auto (any detected GPU, else software)"},
                 {"value": "qsv", "label": "Intel Quick Sync (QSV)"},
                 {"value": "vaapi", "label": "VA-API (Intel/AMD)"},
                 {"value": "nvenc", "label": "NVIDIA NVENC"},
@@ -223,7 +222,7 @@ SETTINGS_SCHEMA = {
                 {"value": "8", "label": "8"},
                 {"value": "0", "label": "Auto (all cores)"},
             ]},
-            "ENCODER_THREADS": {"label": "Encoder Threads", "type": "select", "group": "advanced", "options": [
+            "ENCODER_THREADS": {"label": "Encoder Threads", "show_if": {"HW_BACKEND": ["", "software"]}, "type": "select", "group": "advanced", "options": [
                 {"value": "1", "label": "1"},
                 {"value": "2", "label": "2"},
                 {"value": "4", "label": "4"},

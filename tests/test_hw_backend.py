@@ -49,34 +49,6 @@ def test_unknown_backend_falls_back():
     assert _resolve_backend("magic-gpu", "h264", "none", "/x.mkv") == ("software", None)
 
 
-# ── "auto": lets a shipped preset be portable across every host ──────────────
-
-def test_auto_picks_available_hardware():
-    with patch("transcodarr_core.ffmpeg.capabilities.available_backends",
-               return_value=["qsv", "vaapi", "software"]), \
-         patch("transcodarr_core.ffmpeg.capabilities.get_backend", return_value=_QSV_OK):
-        assert _resolve_backend("auto", "h264", "none", "/x.mkv") == ("qsv", "/dev/dri/renderD128")
-
-
-def test_auto_on_gpuless_host_uses_software():
-    """The shipped hardware preset must not break CPU-only installs."""
-    with patch("transcodarr_core.ffmpeg.capabilities.available_backends",
-               return_value=["software"]):
-        assert _resolve_backend("auto", "h264", "none", "/x.mkv") == ("software", None)
-
-
-def test_auto_probe_failure_uses_software():
-    with patch("transcodarr_core.ffmpeg.capabilities.available_backends",
-               side_effect=RuntimeError("probe died")):
-        assert _resolve_backend("auto", "h264", "none", "/x.mkv") == ("software", None)
-
-
-def test_auto_on_hdr_still_uses_software():
-    with patch("transcodarr_core.ffmpeg.capabilities.available_backends",
-               return_value=["qsv", "software"]):
-        assert _resolve_backend("auto", "h264", "tonemap", "/x.mkv") == ("software", None)
-
-
 def test_shipped_hardware_preset_sets_explicit_quality():
     """
     TARGET_CRF="" means CRF 23 to libx264 but "no quality target" to a hardware
@@ -87,7 +59,8 @@ def test_shipped_hardware_preset_sets_explicit_quality():
     from transcodarr_core.database import DEFAULT_PRESETS
     hw = next(p for p in DEFAULT_PRESETS if p["name"] == "4K Downscale (Hardware)")
     assert hw["settings"]["TARGET_CRF"], "hardware preset must set an explicit quality"
-    assert hw["settings"]["HW_BACKEND"] == "auto", "shipped preset must not name a vendor"
+    assert hw["settings"]["HW_BACKEND"] not in ("", "auto", None), \
+        "backend must be explicit — it is pinned to the detected one at seed time"
     assert hw["settings"]["TARGET_RESOLUTION"] == "1080p_max"
 
 

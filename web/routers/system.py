@@ -10,8 +10,19 @@ from web.shared_state import (
     read_log_tail,
 )
 from transcodarr_core.database import get_storage_history
+from transcodarr_core.ffmpeg.capabilities import detect_capabilities
 
 router = APIRouter()
+
+
+@router.get("/system/capabilities")
+def api_system_capabilities(refresh: bool = Query(default=False)):
+    """
+    Report this node's transcoding backends (hardware + software).
+
+    Cached after first probe; pass ?refresh=1 to re-probe after attaching a GPU.
+    """
+    return detect_capabilities(force=refresh)
 
 
 @router.get("/system/stats")

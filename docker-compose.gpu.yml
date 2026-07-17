@@ -19,3 +19,10 @@ services:
     group_add:
       - "${RENDER_GID:?Set RENDER_GID in .env - see the comment above}"
       - "${VIDEO_GID:-44}"
+    environment:
+      # Surfaced read-only in the UI (Settings -> Hardware) so the effective GPU
+      # config is visible. They don't change behaviour on their own — devices/
+      # group_add above do the actual passthrough.
+      - GPU_DEVICE=${GPU_DEVICE:-/dev/dri}
+      - RENDER_GID=${RENDER_GID}
+      - VIDEO_GID=${VIDEO_GID:-44}

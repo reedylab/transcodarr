@@ -2042,6 +2042,12 @@ function _updateSelectAllBanner(type) { /* no-op until kickoff installs real imp
       return;
     }
 
+    // Special handling for hardware transcoding — detection + read-only env
+    if (section.type === "hardware") {
+      renderHardwareSection(container, section);
+      return;
+    }
+
     // Special handling for encoding section — presets + two-column layout
     if (sectionKey === "encoding") {
       renderEncodingSection(container, section);
@@ -3480,53 +3486,94 @@ function _updateSelectAllBanner(type) { /* no-op until kickoff installs real imp
     } catch {}
   }
 
-  // ----- Transcoding hardware capabilities -----
-  let hwCaps = null;
-
-  async function loadHwCapabilities(refresh = false) {
-    const body = $("#hw-body");
-    if (!body) return;
-    try {
-      const r = await fetch(`${API}/system/capabilities${refresh ? "?refresh=1" : ""}`, {cache:"no-store"});
-      if (!r.ok) return;
-      hwCaps = await r.json();
-      renderHwCapabilities();
-    } catch {}
+  // ----- Settings → Hardware: detection + read-only passthrough env -----
+  function _hwBackendRow(b) {
+    const ok = b.available;
+    // An unavailable backend's reason is the actionable part — surface it.
+    const detail = ok ? [b.device, b.driver].filter(Boolean).join(" · ")
+                      : (b.reason || "unavailable");
+    const codecs = ok && (b.codecs || []).length
+      ? b.codecs.map(c => `<span class="hw-codec">${escapeHtml(c)}</span>`).join("") : "";
+    const decode = ok && (b.decode_codecs || []).length
+      ? `<div class="hw-detail">decode: ${b.decode_codecs.map(escapeHtml).join(", ")}</div>` : "";
+    const sessions = ok && b.max_sessions ? `max ${b.max_sessions} concurrent` : "";
+    return `
+      <div class="hw-row${ok ? " hw-on" : " hw-off"}">
+        <div class="hw-status">${ok ? "●" : "○"}</div>
+        <div class="hw-main">
+          <div class="hw-name">${escapeHtml(b.label || b.id)}</div>
+          <div class="hw-detail">${escapeHtml(detail)}</div>${decode}
+        </div>
+        <div class="hw-codecs">${codecs}</div>
+        <div class="hw-sessions">${escapeHtml(sessions)}</div>
+      </div>`;
   }
 
-  function renderHwCapabilities() {
-    const body = $("#hw-body");
-    if (!body || !hwCaps) return;
+  function _hwEnvRows(env) {
+    const rows = [
+      ["GPU_DEVICE", "GPU device"],
+      ["RENDER_GID", "Render group GID"],
+      ["VIDEO_GID", "Video group GID"],
+      ["NVIDIA_VISIBLE_DEVICES", "NVIDIA devices"],
+    ];
+    return rows.map(([k, label]) => {
+      const v = (env || {})[k] || "";
+      return `<div class="setting-field">
+        <label>${label} <span class="hw-envkey">${k}</span></label>
+        <div class="input-wrap">
+          <input type="text" value="${escapeHtml(v)}" placeholder="(not set)" disabled>
+        </div></div>`;
+    }).join("");
+  }
 
-    const note = $("#hw-cap-note");
-    if (note) {
-      note.textContent = hwCaps.hardware_available
-        ? `node: ${hwCaps.node_id}`
-        : `node: ${hwCaps.node_id} — no hardware detected, encoding on CPU`;
+  async function renderHardwareSection(container) {
+    container.innerHTML = `<div class="hw-note">Detecting hardware…</div>`;
+    let caps;
+    try {
+      const r = await fetch(`${API}/system/capabilities`, {cache: "no-store"});
+      caps = await r.json();
+    } catch {
+      container.innerHTML = `<div class="hw-note">Could not load hardware info.</div>`;
+      return;
     }
 
-    body.innerHTML = (hwCaps.backends || []).map(b => {
-      const ok = b.available;
-      // An unavailable backend's reason is the actionable part — surface it rather
-      // than just greying the row out.
-      const detail = ok
-        ? [b.device, b.driver].filter(Boolean).join(" · ")
-        : (b.reason || "unavailable");
-      const codecs = ok && b.codecs && b.codecs.length
-        ? b.codecs.map(c => `<span class="hw-codec">${escapeHtml(c)}</span>`).join("")
-        : "";
-      const sessions = ok && b.max_sessions ? `max ${b.max_sessions} concurrent` : "";
-      return `
-        <div class="hw-row${ok ? " hw-on" : " hw-off"}">
-          <div class="hw-status">${ok ? "●" : "○"}</div>
-          <div class="hw-main">
-            <div class="hw-name">${escapeHtml(b.label || b.id)}</div>
-            <div class="hw-detail">${escapeHtml(detail)}</div>
-          </div>
-          <div class="hw-codecs">${codecs}</div>
-          <div class="hw-sessions">${escapeHtml(sessions)}</div>
-        </div>`;
-    }).join("");
+    const active = !!caps.hardware_available;
+    const backends = (caps.backends || []).map(_hwBackendRow).join("");
+    const envRows = _hwEnvRows(caps.env);
+
+    if (!active) {
+      // No GPU reached the container — grey everything and point at setup.
+      container.innerHTML = `
+        <div class="hw-disabled">
+          <div class="hw-empty-head">No GPU detected — encoding on CPU</div>
+          <p>Hardware transcoding isn't configured. Start the container with a GPU overlay
+             on top of the base compose file:</p>
+          <pre>docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d</pre>
+          <p><b>Intel / AMD:</b> set <code>RENDER_GID</code> in <code>.env</code>
+             (<code>getent group render | cut -d: -f3</code>).<br>
+             <b>NVIDIA:</b> install the NVIDIA Container Toolkit and use
+             <code>-f docker-compose.gpu-nvidia.yml</code>.</p>
+        </div>
+        <div class="hw-subhead">Detected backends</div>
+        <div class="hw-body">${backends}</div>
+        <div class="hw-subhead">Passthrough configuration <span class="hw-ro">(read-only · empty)</span></div>
+        <div class="hw-env greyed">${envRows}</div>`;
+      return;
+    }
+
+    container.innerHTML = `
+      <div class="hw-active-banner">✓ Hardware transcoding active — node <b>${escapeHtml(caps.node_id)}</b></div>
+      <div class="hw-subhead">Detected backends</div>
+      <div class="hw-body">${backends}</div>
+      <div class="hw-subhead">Passthrough configuration <span class="hw-ro">(read-only · set via compose / .env)</span></div>
+      <div class="hw-env">${envRows}</div>
+      <div class="hw-enable">
+        <b>To use it:</b> select a hardware encoding preset (e.g. <b>4K Downscale (QSV)</b>),
+        or point an Auto rule at one.
+        <button class="btn btn-sm" id="hw-goto-encoding">Open Encoding presets →</button>
+      </div>`;
+    const goto = container.querySelector("#hw-goto-encoding");
+    if (goto) goto.addEventListener("click", () => showSettingsSection("encoding"));
   }
 
   async function loadStorageHistory() {
@@ -3962,26 +4009,10 @@ function _updateSelectAllBanner(type) { /* no-op until kickoff installs real imp
       statsViewActive = true;
       updateSystemStats();
       loadStorageHistory();
-      // Capabilities are a cached probe server-side, so fetch once per view entry
-      // rather than on the stats poll interval.
-      if (!hwCaps) loadHwCapabilities();
     } else if (!isVisible) {
       statsViewActive = false;
     }
   }
-
-  // Re-detect is the entry point after attaching a GPU without restarting.
-  document.addEventListener("click", (e) => {
-    const btn = e.target.closest("#hw-refresh");
-    if (!btn) return;
-    btn.disabled = true;
-    const prev = btn.textContent;
-    btn.textContent = "Detecting…";
-    loadHwCapabilities(true).finally(() => {
-      btn.disabled = false;
-      btn.textContent = prev;
-    });
-  });
 
   // Hook into nav clicks to detect stats view
   $$(".nav-item").forEach(b => {

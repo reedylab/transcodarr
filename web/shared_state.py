@@ -240,6 +240,13 @@ SETTINGS_SCHEMA = {
             ]},
         }
     },
+    # Custom-rendered (see renderHardwareSection in ui.js): detected GPU backends +
+    # read-only passthrough env + how to enable. No editable fields of its own.
+    "hardware": {
+        "label": "Hardware",
+        "type": "hardware",
+        "fields": {},
+    },
     "integrations": {
         "label": "Integrations",
         "type": "integrations",

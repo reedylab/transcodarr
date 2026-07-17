@@ -15,14 +15,29 @@ from transcodarr_core.ffmpeg.capabilities import detect_capabilities
 router = APIRouter()
 
 
+_HW_ENV_KEYS = ("GPU_DEVICE", "RENDER_GID", "VIDEO_GID", "NVIDIA_VISIBLE_DEVICES")
+
+
+def _hw_env() -> dict:
+    """Hardware-passthrough env vars as the container actually sees them.
+
+    Populated by the GPU compose overlays; empty here means the base (GPU-less)
+    compose is in use. Read-only surface — the real passthrough is done by the
+    overlay's devices/group_add, not these values.
+    """
+    return {k: os.environ.get(k, "") for k in _HW_ENV_KEYS}
+
+
 @router.get("/system/capabilities")
 def api_system_capabilities(refresh: bool = Query(default=False)):
     """
-    Report this node's transcoding backends (hardware + software).
+    Report this node's transcoding backends (hardware + software) and the
+    hardware-passthrough env config.
 
     Cached after first probe; pass ?refresh=1 to re-probe after attaching a GPU.
     """
-    return detect_capabilities(force=refresh)
+    # Copy so the cached capability dict isn't mutated with per-request env.
+    return {**detect_capabilities(force=refresh), "env": _hw_env()}
 
 
 @router.get("/system/stats")

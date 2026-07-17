@@ -5,7 +5,7 @@ Transcodarr Core Library
 Core pipeline, subtitle handling, and transcoding helpers.
 """
 
-__version__ = "1.2.0"
+__version__ = "1.3.0"
 from .config import Settings
 from .meta import find_meta_json, _load_imdb_from_meta, find_unified_meta, load_unified_meta
 from .nfo import write_nfo_from_meta, write_tvshow_nfo_if_missing, write_tvshow_nfo

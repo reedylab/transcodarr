@@ -1,5 +1,23 @@
 # Changelog
 
+## v1.3.0 (2026-07-17)
+
+Hardware-accelerated transcoding.
+
+### Added
+- **Hardware transcoding** — full GPU pipeline (decode → scale → HDR tone-map → encode) for Intel Quick Sync (QSV), VA-API (Intel/AMD), and NVIDIA NVENC. Frames stay on the GPU end-to-end; ~4× faster and ~13× less CPU than software on an Intel iGPU. Opt-in via GPU compose overlays (`docker-compose.gpu.yml`, `docker-compose.gpu-nvidia.yml`) — the base image stays GPU-less.
+- **Per-node capability detection** — probes each backend with a real test encode (not just `ffmpeg -encoders`), reporting the encode/decode codecs and tone-mappers it can actually use. Exposed at `GET /api/system/capabilities`.
+- **Settings → Hardware** — detected backends, read-only passthrough config, and how to enable.
+- **Per-preset encode backend** — hardware vs. software is an encoding-preset setting routed by the Auto rules; hardware presets are seeded per detected backend (e.g. `4K Downscale (QSV)` / `4K Downscale (VA-API)`).
+- **GPU HDR→SDR tone-mapping** (VA-API / OpenCL), chosen per file, with a software fallback.
+- **Automatic software fallback** — any backend, codec, or source that isn't hardware-capable (e.g. AV1 on a GPU without AV1 decode) drops to software per-job instead of failing; the encode backend is labeled in the logs.
+- `HW_MAX_WORKERS` — global cap on concurrent hardware encodes for GPU session limits.
+- README **Hardware Transcoding** section with screenshots.
+
+### Fixed
+- Re-transcode loop for files whose metadata sidecar was missing — the source is now identified via a Radarr/Sonarr path lookup and cleaned up, and the transcode-history circuit breaker records again (a swallowed `NameError` had silently disabled it).
+- `build_ffmpeg_cmd` tests read the live settings database — they passed in CI but failed on a configured host, so they were guarding nothing there.
+
 ## v1.2.0 (2026-06-27)
 
 First release published as a prebuilt Docker image — `docker pull ghcr.io/reedylab/transcodarr:1.2.0` (or `:latest`).

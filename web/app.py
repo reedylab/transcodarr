@@ -82,10 +82,22 @@ async def lifespan(app: FastAPI):
     app.state.worker_pool = worker_pool
     set_worker_pool(worker_pool)
 
-    # Auto-start watchdog at boot when AUTO_WORKERS > 0.
+    # In node mode, skip the watchdog entirely — a node doesn't discover files, it
+    # runs jobs the master hands it — and start the agent that registers with the
+    # master and heartbeats.
+    _mode = (s.TRANSCODARR_MODE or "master").lower()
+    app.state.node_agent = None
+    if _mode == "node":
+        from transcodarr_core.node_agent import NodeAgent
+        agent = NodeAgent(s)
+        agent.start()
+        app.state.node_agent = agent
+        logging.info("[STARTUP] Running in NODE mode — watchdog disabled, agent connecting to master")
+
+    # Auto-start watchdog at boot when AUTO_WORKERS > 0 (master mode only).
     # Mirrors POST /api/start body; tolerates a stale /tmp/transcodarr.run lock
     # left behind if a previous process exited without releasing it.
-    if init_aw > 0:
+    if _mode == "master" and init_aw > 0:
         try:
             from threading import Thread
             from web.shared_state import _state, acquire_run_lock, _bg
@@ -122,6 +134,8 @@ async def lifespan(app: FastAPI):
     yield
 
     # ── Shutdown ──
+    if getattr(app.state, "node_agent", None):
+        app.state.node_agent.stop()
     if worker_pool:
         worker_pool.stop(wait=True)
 

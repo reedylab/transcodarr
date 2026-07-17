@@ -140,6 +140,61 @@ docker compose -f docker-compose.reencode.yml up -d --build
 
 The watchdog is disabled in this mode. Use the web UI to browse your library and trigger batch re-encodes manually. Files are processed in-place — copied to temp, transcoded, then the original is replaced.
 
+## Hardware Transcoding
+
+Offload transcoding to your GPU. Transcodarr runs the **whole pipeline on the GPU** — decode, scale, HDR tone-map, and encode — so frames never touch the CPU. On an Intel UHD 630 this measured **~4× faster wall-clock and ~13× less CPU** than software for a 4K→1080p H.264 job.
+
+It's fully **opt-in**: the base image and `docker-compose.yml` stay GPU-less and work everywhere. You enable hardware by layering a GPU compose file on top.
+
+### 1. Enable GPU access
+
+**Intel (Quick Sync / VA-API) or AMD (VA-API):**
+```bash
+# find your host's "render" group GID — it varies by distro
+#   Ubuntu 24.04: 993   ·   Debian 12: 106
+getent group render | cut -d: -f3
+
+# put it in .env, then start with the GPU overlay
+echo "RENDER_GID=993" >> .env      # use the value from above
+docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d --build
+```
+
+**NVIDIA (NVENC):** install the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html), then:
+```bash
+docker compose -f docker-compose.yml -f docker-compose.gpu-nvidia.yml up -d --build
+```
+
+### 2. Confirm it's detected
+
+Open **Settings → Hardware**. Transcodarr *probes* each backend (it runs a real test encode, so it only advertises what actually works on your hardware) and shows the encode/decode codecs and your passthrough config:
+
+![Settings → Hardware — detected backends, codecs, and read-only passthrough config](screenshots/screenshot-9-hardware.png)
+
+If it says **"No GPU detected"**, the section greys out and tells you exactly what to fix:
+
+![Hardware section when no GPU reached the container](screenshots/screenshot-11-hw-empty.png)
+
+### 3. Use it
+
+Hardware vs. software is a property of each **encoding preset** (the `Encode Backend` setting), so you control it exactly like every other encoding choice. When a GPU is detected, ready-made presets are created for it automatically — an Intel box gets **`4K Downscale (QSV)`** and **`4K Downscale (VA-API)`**. Activate one, or point an Auto rule's **Use Preset** at it to route by source:
+
+![Encoding presets — per-backend hardware presets, targetable from Auto rules](screenshots/screenshot-10-hw-presets.png)
+
+### What's supported
+
+| Backend | Hardware | Encode | Decode | HDR tone-map |
+|---|---|---|---|---|
+| **Intel Quick Sync (QSV)** | Intel iGPU | H.264, HEVC | H.264/HEVC/VP9/MPEG-2/VC-1 | via software |
+| **VA-API** | Intel / AMD | H.264, HEVC | (same, driver-dependent) | on GPU (VA-API / OpenCL) |
+| **NVIDIA NVENC** | NVIDIA GPU | H.264, HEVC | H.264/HEVC/VP9/AV1¹ | via software |
+| **Software** | any CPU | H.264/HEVC/VP9/AV1 | anything | on CPU |
+
+- **Automatic fallback, never a failed job.** If a backend, codec, or source isn't hardware-decodable (e.g. an AV1 source on a GPU without AV1 decode), that job transparently drops to software — the logs say which.
+- **HDR → SDR tone-mapping on the GPU** when your target is 8-bit (H.264). VA-API is used when the source carries HDR10 mastering-display metadata, OpenCL otherwise; both fall back to the software tone-mapper.
+- **Concurrency cap.** GPUs have hard session limits (an Intel iGPU sustains ~3 concurrent 1080p encodes; consumer NVIDIA cards are driver-capped at 2). `HW_MAX_WORKERS` (Settings → General) bounds hardware jobs across all workers; blank = auto-detected.
+
+¹ Intel QSV/VA-API are the most tested paths. NVENC is implemented and gated behind the same detection + fallback, but the reference hardware is Intel — please report NVIDIA issues.
+
 ## Configuration
 
 All runtime settings are stored in PostgreSQL and configurable through the UI. The app reads settings with this priority:
@@ -382,6 +437,8 @@ Transcoding is CPU and memory intensive. Each worker runs a full FFmpeg process,
 | 4+ | 16 GB+ | 8+ | Recommended for parallel batch jobs |
 
 These are rough guidelines — actual usage depends on codec, resolution, and source file size. H.265 and AV1 encoding are significantly more demanding than H.264. Monitor your system with the built-in CPU/RAM charts and adjust worker counts live from the UI.
+
+The table above is for **software** transcoding. With a GPU, CPU load drops dramatically (~13× on the reference hardware) — see [Hardware Transcoding](#hardware-transcoding).
 
 ## Tech Stack
 

@@ -148,6 +148,17 @@ class Settings(BaseSettings):
     # Transcodarr external URL (for webhooks)
     TRANSCODARR_URL: str | None = None
 
+    # Clustering / multi-node (infrastructure — set via compose env, not the DB).
+    # "master" (default) is a normal standalone install that can also farm jobs to
+    # nodes; "node" is a headless ffmpeg executor that registers with a master.
+    TRANSCODARR_MODE: str = "master"
+    # Node-only: where to reach the master, e.g. http://192.168.20.34:5025
+    MASTER_URL: str | None = None
+    # Shared secret a node presents to the master (must match on both).
+    NODE_TOKEN: str | None = None
+    # Stable identity for a node in the master's registry (defaults to the hostname).
+    NODE_ID: str | None = None
+
     # Media paths (infrastructure, set via docker-compose volumes)
     MOVIES_WATCH_PATH: str = "/watch/movies"
     TV_WATCH_PATH: str = "/watch/tv"

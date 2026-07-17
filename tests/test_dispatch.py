@@ -232,3 +232,56 @@ def test_discard_cleans_temp(monkeypatch):
     p.discard_dispatched_job(ctx)
     p.discard_dispatched_job(None)        # no-op, no crash
     assert cleaned == [ctx]
+
+
+# ---- step 5: requeue on node offline ----
+
+def test_reap_offline_requeues_dead_nodes_jobs():
+    import time
+    cluster.register_node("sw", "10.0.0.1", caps(), 2, True)
+    dispatch.enqueue(payload("A"))
+    dispatch.claim_for_node("sw")
+    assert dispatch.snapshot()["inflight_count"] == 1
+    # node stops heartbeating -> offline
+    cluster._nodes["sw"]["last_seen"] = time.time() - (cluster.HEARTBEAT_TIMEOUT_S + 5)
+    assert dispatch.reap_offline() == 1
+    snap = dispatch.snapshot()
+    assert snap["inflight_count"] == 0 and snap["pending_count"] == 1
+
+
+def test_reap_offline_leaves_live_nodes_alone():
+    cluster.register_node("sw", "10.0.0.1", caps(), 2, True)
+    dispatch.enqueue(payload("A"))
+    dispatch.claim_for_node("sw")
+    assert dispatch.reap_offline() == 0          # node is still online
+    assert dispatch.snapshot()["inflight_count"] == 1
+
+
+def test_reap_offline_requeues_vanished_node():
+    cluster.register_node("sw", "10.0.0.1", caps(), 2, True)
+    dispatch.enqueue(payload("A"))
+    dispatch.claim_for_node("sw")
+    cluster.remove_node("sw")                     # node gone from the registry entirely
+    assert dispatch.reap_offline() == 1
+    assert dispatch.snapshot()["pending_count"] == 1
+
+
+def test_requeued_job_is_reclaimable_by_another_node():
+    import time
+    cluster.register_node("a", "10.0.0.1", caps(), 2, True)
+    cluster.register_node("b", "10.0.0.2", caps(), 2, True)
+    dispatch.enqueue(payload("A"))
+    dispatch.claim_for_node("a")
+    cluster._nodes["a"]["last_seen"] = time.time() - 999
+    dispatch.reap_offline()
+    job = dispatch.claim_for_node("b")            # the survivor picks it up
+    assert job is not None and job["base_name"] == "A"
+
+
+def test_cluster_is_online():
+    import time
+    cluster.register_node("a", "10.0.0.1", caps(), 2, True)
+    assert cluster.is_online("a") is True
+    assert cluster.is_online("ghost") is False
+    cluster._nodes["a"]["last_seen"] = time.time() - 999
+    assert cluster.is_online("a") is False

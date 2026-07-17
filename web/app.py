@@ -122,6 +122,26 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             logging.error("[STARTUP] Failed to auto-start watchdog: %s", e)
 
+    # Master reaper: periodically requeue the in-flight jobs of nodes that have gone
+    # offline, so their work isn't stranded. Cheap no-op when no jobs are dispatched
+    # (the default until CLUSTER_DISPATCH_ENABLED is set).
+    app.state.reaper_stop = None
+    if _mode == "master":
+        from threading import Event, Thread
+        from transcodarr_core import dispatch
+
+        reaper_stop = Event()
+
+        def _reaper():
+            while not reaper_stop.wait(10.0):
+                try:
+                    dispatch.reap_offline()
+                except Exception as e:
+                    logging.warning("[CLUSTER] reaper pass failed: %s", e)
+
+        app.state.reaper_stop = reaper_stop
+        Thread(target=_reaper, daemon=True, name="cluster-reaper").start()
+
     # Start system stats collector
     start_stats_collector()
 
@@ -134,6 +154,8 @@ async def lifespan(app: FastAPI):
     yield
 
     # ── Shutdown ──
+    if getattr(app.state, "reaper_stop", None):
+        app.state.reaper_stop.set()
     if getattr(app.state, "node_agent", None):
         app.state.node_agent.stop()
     if worker_pool:

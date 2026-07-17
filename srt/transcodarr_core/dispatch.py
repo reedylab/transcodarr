@@ -178,6 +178,23 @@ def _reset_to_pending(job: dict) -> None:
     _pending.append(job)
 
 
+def reap_offline() -> int:
+    """Requeue the in-flight jobs of any node that has gone offline (missed heartbeats)
+    or vanished from the registry, so a surviving/returning node can pick them up. Meant
+    to be called periodically by the master's reaper. Returns the number requeued.
+
+    Idempotent: once a node's jobs are moved back to pending they're no longer in-flight
+    for it, so a later pass finds nothing. The source file is never touched by dispatch,
+    so a job that finds no eligible node simply waits in the queue."""
+    with _lock:
+        stuck_nodes = {j["node_id"] for j in _inflight.values() if j["node_id"]}
+    total = 0
+    for node_id in stuck_nodes:
+        if not cluster.is_online(node_id):
+            total += requeue_node_jobs(node_id)
+    return total
+
+
 def try_dispatch(ctx) -> bool:
     """Pipeline hook, called after PREP. If cluster dispatch is enabled and an eligible
     node is connected, enqueue this prepped job for a node and return True — the master

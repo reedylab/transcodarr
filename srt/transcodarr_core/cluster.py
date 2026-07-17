@@ -76,6 +76,14 @@ def _online(node: dict) -> bool:
     return (time.time() - node["last_seen"]) <= HEARTBEAT_TIMEOUT_S
 
 
+def is_online(node_id: str) -> bool:
+    """Whether a node is known and within its heartbeat window. The dispatcher uses
+    this to decide when a node's in-flight jobs should be requeued."""
+    with _lock:
+        n = _nodes.get(node_id)
+        return bool(n and _online(n))
+
+
 def _prune_stale(now: float) -> None:
     """Drop nodes that have been offline past the stale window. Caller holds _lock."""
     for nid in [k for k, n in _nodes.items() if now - n["last_seen"] > STALE_TIMEOUT_S]:

@@ -3676,6 +3676,49 @@ function _updateSelectAllBanner(type) { /* no-op until kickoff installs real imp
       </div>`;
   }
 
+  // ----- Node-mode dormant view -----
+  function renderNodeDormant(info) {
+    // A node has no watchdog/media/settings of its own — hide the app and the
+    // master-only header controls, show a status card.
+    ["#auto-group", "#manual-group", "#nodes-group", "#start-btn", "#stop-btn"]
+      .forEach(sel => { const el = $(sel); if (el) el.style.display = "none"; });
+    const shell = document.querySelector(".app-shell");
+    if (shell) shell.style.display = "none";
+    const d = $("#node-dormant");
+    if (!d) return;
+    const connected = !!info.registered;
+    const backends = (info.backends || [])
+      .map(b => `<span class="hw-codec">${escapeHtml(b)}</span>`).join("") || "—";
+    const storage = info.storage_ok
+      ? '<span style="color:var(--ok)">✓ shared storage visible</span>'
+      : `<span style="color:var(--danger)">✗ ${escapeHtml(info.storage_detail || "storage not visible")}</span>`;
+    d.innerHTML = `
+      <div class="node-card">
+        <div class="node-badge">NODE MODE</div>
+        <h2>This is a Transcodarr node</h2>
+        <div class="node-conn ${connected ? "on" : "off"}">
+          ${connected ? "●" : "○"} ${connected ? "Connected to" : "Not connected —"}
+          <b>${escapeHtml(info.master_url || "MASTER_URL not set")}</b>
+        </div>
+        <div class="node-grid">
+          <div><span>Node ID</span>${escapeHtml(info.node_id || "—")}</div>
+          <div><span>Workers</span>${info.worker_count ?? "—"}</div>
+          <div><span>Storage</span>${storage}</div>
+          <div><span>Backends</span><div class="hw-codecs">${backends}</div></div>
+        </div>
+        <p class="node-foot">This install runs transcodes dispatched by the master.
+          Manage everything from the master's UI.</p>
+      </div>`;
+    d.style.display = "flex";
+  }
+
+  async function checkNodeMode() {
+    try {
+      const info = await fetch(`${API}/node/status`, {cache: "no-store"}).then(r => r.json());
+      if (info.mode === "node") renderNodeDormant(info);
+    } catch { /* master by default */ }
+  }
+
   async function loadStorageHistory() {
     if (!statsViewActive) return;
     try {
@@ -4275,6 +4318,9 @@ function _updateSelectAllBanner(type) { /* no-op until kickoff installs real imp
   // First-paint: synchronous loads keep tables/status populated for ~500ms before SSE catches up.
   // Logs are NOT pre-populated synchronously — the SSE log stream sends a reset on connect,
   // which would otherwise clear any pre-painted text and cause a flash.
+  // Node mode: render the dormant status page instead of the full app.
+  checkNodeMode();
+
   updateStatus();
   updateWorkerStatus();
   loadMovies(); loadTV();

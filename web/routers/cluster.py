@@ -81,6 +81,19 @@ async def api_cluster_deregister(request: Request):
     return {"status": "deregistered"}
 
 
+@router.get("/node/status")
+def api_node_status(request: Request):
+    """This instance's own role/status — drives the node-mode dormant UI."""
+    s = request.app.state.settings
+    mode = (s.TRANSCODARR_MODE or "master").lower()
+    if mode != "node":
+        return {"mode": mode}
+    agent = getattr(request.app.state, "node_agent", None)
+    if not agent:
+        return {"mode": "node", "registered": False, "error": "agent not started"}
+    return {"mode": "node", **agent.status()}
+
+
 @router.get("/cluster/nodes")
 def api_cluster_nodes(request: Request):
     """Registry snapshot for the UI (no auth — read-only status, same as other UI reads)."""

@@ -68,6 +68,24 @@ class NodeAgent:
             return False, "; ".join(issues)
         return True, "shared storage visible"
 
+    def status(self) -> dict:
+        """Node's own state for its dormant status page."""
+        storage_ok, detail = self.storage_check()
+        try:
+            caps = detect_capabilities()
+            backends = [b["id"] for b in caps.get("backends", []) if b.get("available")]
+        except Exception:
+            backends = []
+        return {
+            "node_id": self.node_id,
+            "master_url": self.master,
+            "registered": self._registered,
+            "worker_count": self.worker_count,
+            "storage_ok": storage_ok,
+            "storage_detail": detail,
+            "backends": backends,
+        }
+
     # ----- master conversation -----
 
     def _headers(self):

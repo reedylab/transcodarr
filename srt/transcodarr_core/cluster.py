@@ -20,6 +20,11 @@ import time
 # heartbeats several times inside the window so a single dropped beat isn't fatal.
 HEARTBEAT_TIMEOUT_S = 15.0
 
+# A node offline longer than this is dropped from the registry entirely — it shows
+# as offline for a grace period (so you can see it dropped), then disappears rather
+# than lingering forever. A returning node just re-registers.
+STALE_TIMEOUT_S = 120.0
+
 _nodes: dict[str, dict] = {}
 _lock = threading.Lock()
 
@@ -71,10 +76,19 @@ def _online(node: dict) -> bool:
     return (time.time() - node["last_seen"]) <= HEARTBEAT_TIMEOUT_S
 
 
+def _prune_stale(now: float) -> None:
+    """Drop nodes that have been offline past the stale window. Caller holds _lock."""
+    for nid in [k for k, n in _nodes.items() if now - n["last_seen"] > STALE_TIMEOUT_S]:
+        _nodes.pop(nid, None)
+        logging.info("[CLUSTER] node %r pruned (offline > %ds)", nid, int(STALE_TIMEOUT_S))
+
+
 def list_nodes() -> list[dict]:
-    """All known nodes with a computed `online` flag and `last_seen_age` (seconds)."""
+    """All known nodes with a computed `online` flag and `last_seen_age` (seconds).
+    Prunes nodes offline past the stale window so dropped nodes don't linger."""
     now = time.time()
     with _lock:
+        _prune_stale(now)
         out = []
         for n in _nodes.values():
             rec = dict(n)

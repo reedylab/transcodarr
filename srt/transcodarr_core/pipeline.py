@@ -539,6 +539,10 @@ def transcode_file(file_path: str, settings: Settings):
         _prep_transcode(ctx)
         if ctx.abort:
             return
+        from . import dispatch
+        if dispatch.try_dispatch(ctx):
+            # Handed to a node; it runs EXECUTE and the master finishes on completion.
+            return
         if not _execute_transcode(
             ctx.ffmpeg_input, ctx.chosen_srt, ctx.tmp_path, ctx.base_name,
             ctx.s, ctx.progress_file,

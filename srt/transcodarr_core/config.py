@@ -158,6 +158,10 @@ class Settings(BaseSettings):
     NODE_TOKEN: str | None = None
     # Stable identity for a node in the master's registry (defaults to the hostname).
     NODE_ID: str | None = None
+    # Master-only: farm eligible jobs out to connected nodes instead of always running
+    # them locally. Off by default — leave off until node-side execute + master
+    # post-processing are wired, or jobs handed to a node will never complete.
+    CLUSTER_DISPATCH_ENABLED: bool = False
 
     # Media paths (infrastructure, set via docker-compose volumes)
     MOVIES_WATCH_PATH: str = "/watch/movies"
@@ -227,7 +231,7 @@ class Settings(BaseSettings):
             return 2  # default
         return int(v)
 
-    @validator("UI_REQUIRES_LOGIN", pre=True, always=True)
+    @validator("UI_REQUIRES_LOGIN", "CLUSTER_DISPATCH_ENABLED", pre=True, always=True)
     def empty_str_to_false_bool(cls, v):
         if v == "" or v is None:
             return False

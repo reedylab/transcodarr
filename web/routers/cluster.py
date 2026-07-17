@@ -12,7 +12,7 @@ heartbeat reply carries no work.
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
-from transcodarr_core import cluster
+from transcodarr_core import cluster, dispatch
 
 router = APIRouter()
 
@@ -57,7 +57,8 @@ async def api_cluster_register(request: Request):
 
 @router.post("/cluster/heartbeat")
 async def api_cluster_heartbeat(request: Request):
-    """Liveness + current status. Reply will carry a job assignment in Phase 2."""
+    """Liveness + current status. The reply may carry a job assignment: if this node
+    is eligible and has a free slot, the scheduler hands it the next pending job."""
     ok, err = _auth(request)
     if not ok:
         return err
@@ -68,7 +69,7 @@ async def api_cluster_heartbeat(request: Request):
     if not known:
         # Master was restarted / never saw this node — tell it to re-register.
         return JSONResponse({"status": "unknown", "action": "reregister"}, status_code=409)
-    return {"status": "ok", "assignment": None}
+    return {"status": "ok", "assignment": dispatch.claim_for_node(node_id)}
 
 
 @router.post("/cluster/deregister")
@@ -101,6 +102,8 @@ def api_cluster_nodes(request: Request):
     return {
         "mode": (request.app.state.settings.TRANSCODARR_MODE or "master").lower(),
         "clustering_enabled": bool(request.app.state.settings.NODE_TOKEN),
+        "dispatch_enabled": bool(getattr(request.app.state.settings, "CLUSTER_DISPATCH_ENABLED", False)),
         "nodes": nodes,
         "node_worker_total": cluster.aggregate_worker_count(),
+        "dispatch": dispatch.snapshot(),
     }

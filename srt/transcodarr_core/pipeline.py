@@ -8,6 +8,7 @@ from typing import Callable
 import shutil
 import time
 import contextlib
+from dataclasses import dataclass
 from .config import Settings
 #from transcodarr_core import load_unified_meta
 from subliminal import scan_video, list_subtitles, download_subtitles
@@ -498,443 +499,555 @@ def _write_nfo_for_reencode(meta: dict, video_path: str) -> None:
 # -------------------------------------------------------------------
 # Core transcode path
 # -------------------------------------------------------------------
+@dataclass
+class TranscodeContext:
+    """State that crosses the prep/execute/post boundaries of one transcode.
+
+    Populated by _prep_transcode, consumed by _execute_transcode (via the explicit
+    args the orchestrator unpacks) and _post_transcode. The execute-relevant subset
+    (ffmpeg_input, chosen_srt, tmp_path, base_name, settings_override) is exactly the
+    job payload a node will receive in Phase 2. All fields default to None/False so
+    _cleanup_transcode stays safe even when prep aborts before populating them."""
+    file_path: str
+    s: Settings
+    base_name: Optional[str] = None
+    src_dir: Optional[str] = None
+    is_reencode: bool = False
+    meta: Optional[dict] = None
+    ep_src: Optional[str] = None
+    output_dir: Optional[str] = None
+    temp_dir: Optional[str] = None
+    temp_root: Optional[str] = None
+    temp_source: Optional[str] = None
+    tmp_path: Optional[str] = None
+    progress_file: Optional[str] = None
+    final_path: Optional[str] = None
+    ok_marker: Optional[str] = None
+    sentinel_path: Optional[str] = None
+    settings_override: Optional[dict] = None
+    chosen_srt: Optional[str] = None
+    ffmpeg_input: Optional[str] = None
+    abort: bool = False
+
+
 def transcode_file(file_path: str, settings: Settings):
+    """Local (master-runs-it) transcode: prep -> execute -> post. The three phases
+    are split so Phase 2 can run prep/post on the master and hand execute to a node;
+    here they still run inline, one machine, exactly as before."""
+    ctx = TranscodeContext(file_path=file_path, s=(settings or Settings()))
     try:
-        s = settings or Settings()
-        from .config import get_media_paths
-        _mpaths = get_media_paths(s)
-        base_name   = os.path.splitext(os.path.basename(file_path))[0]
-        src_dir   = os.path.dirname(file_path)
-
-        # ---------- detect re-encode (source lives inside any output path) ----------
-        _src_resolved = os.path.realpath(file_path)
-        is_reencode = any(
-            _src_resolved.startswith(os.path.realpath(p) + os.sep)
-            for p in [_mpaths["movies_output"], _mpaths["tv_output"]]
-        )
-
-        if is_reencode:
-            logging.info("[RE-ENCODE] Detected re-encode for: %s", file_path)
-
-        # NEW: run enrichment for TV episodes before we pick subtitles
-        if not is_reencode:
-            try:
-                meta = load_unified_meta(file_path) or {}
-                if not meta:
-                    # No sidecar next to the media — the external write_meta script
-                    # didn't run, or the episode title contains characters it choked
-                    # on (e.g. "ronny/lily"). Build one from Radarr/Sonarr by path and
-                    # persist it next to the source so downstream NFO/poster AND source
-                    # cleanup can classify the file. Without this, cleanup hits
-                    # "Unknown kind", never removes the source, and the watchdog
-                    # re-transcodes it on every scan.
-                    built = build_meta_json_from_arr(file_path, s, src_dir)
-                    if built:
-                        meta = load_unified_meta(file_path) or {}
-                        logging.info("[ENRICH] Built sidecar from Radarr/Sonarr path lookup: %s", built)
-                    else:
-                        logging.warning("[ENRICH] No sidecar and no Radarr/Sonarr match for: %s", file_path)
-                if (meta.get("kind") or "").lower() == "episode":
-                    enrich_episode_ids(file_path)  # writes back to .meta.json if needed
-            except Exception as e:
-                logging.debug("[ENRICH] skipped: %s", e)
-        else:
-            meta = {}
-
-        ep_src = get_ep_code(file_path)  # NEW: remember source ep (None for movies)
-
-        # ---------- path calculation (branched for re-encode) ----------
-        temp_root = s.MEDIA_TEMP_FOLDER or "/temp"
-        if is_reencode:
-            # Determine which output path this file is under
-            _media_type = "movies"
-            for _okey, _mtype in [("movies_output", "movies"), ("tv_output", "tv")]:
-                _oresolved = os.path.realpath(_mpaths[_okey])
-                if _src_resolved.startswith(_oresolved + os.sep):
-                    relative_dir = os.path.relpath(src_dir, _mpaths[_okey])
-                    _media_type = _mtype
-                    break
-            else:
-                relative_dir = os.path.basename(src_dir)
-            output_dir = src_dir
-            temp_dir = os.path.join(temp_root, "_reencode", _media_type, relative_dir)
-        else:
-            # Determine output dir from configured media paths
-            _fp = file_path.replace(os.sep, "/")
-            if _fp.startswith(_mpaths["movies_watch"]):
-                relative_dir = os.path.relpath(src_dir, _mpaths["movies_watch"])
-                output_dir = os.path.join(_mpaths["movies_output"], relative_dir)
-                _media_type = "movies"
-            elif _fp.startswith(_mpaths["tv_watch"]):
-                relative_dir = os.path.relpath(src_dir, _mpaths["tv_watch"])
-                output_dir = os.path.join(_mpaths["tv_output"], relative_dir)
-                _media_type = "tv"
-            else:
-                relative_dir = os.path.basename(src_dir)
-                output_dir = os.path.join(_mpaths["movies_output"], relative_dir)
-                _media_type = "movies"
-                logging.warning("[TRANSCODE] File not under any configured watch path, defaulting to movies output: %s", file_path)
-            temp_dir = os.path.join(temp_root, _media_type, relative_dir)
-
-        os.makedirs(temp_dir, exist_ok=True)
-
-        # Copy source video to temp for re-encode so OUTPUT stays clean
-        if is_reencode:
-            temp_source = os.path.join(temp_dir, os.path.basename(file_path))
-            if not os.path.exists(temp_source):
-                logging.info("[RE-ENCODE] Copying source to temp: %s -> %s", file_path, temp_source)
-                shutil.copy2(file_path, temp_source)
-        else:
-            temp_source = None
-
-        container     = s.TARGET_CONTAINER or ".mp4"
-        tmp_path      = os.path.join(temp_dir, base_name + ".tmp" + container)
-        progress_file = os.path.join(temp_dir, base_name + ".progress.json")
-        final_path    = os.path.join(output_dir, base_name + container)
-        ok_marker     = os.path.join(output_dir, f".{base_name}.ok")
-
-        # ---------- sentinel handling (skip for re-encode) ----------
-        sentinel_path = os.path.join(src_dir, SENTINEL_NAME)
-        if not is_reencode and os.path.exists(sentinel_path):
-            logging.info(f"[SENTINEL] Removing stale sentinel: {sentinel_path}")
-            with contextlib.suppress(Exception):
-                os.remove(sentinel_path)
-
-        # ---------- thresholds (unchanged) ----------
-        try:
-            FFSUBSYNC_MAX_OFFSET = float(os.getenv("FFSUBSYNC_MAX_OFFSET", "0.5"))
-        except Exception:
-            FFSUBSYNC_MAX_OFFSET = 0.5
-        MAX_RETRIES     = int(os.getenv("FFSUBSYNC_MAX_RETRIES", "5"))
-        MIN_IMPROVEMENT = float(os.getenv("FFSUBSYNC_MIN_IMPROVEMENT", "0.5"))
-
-        # ---------- NFO metadata fallback for re-encode ----------
-        # Track whether we have a real .meta.json file (not just NFO-derived dict)
-        _reencode_has_meta_json = False
-        if is_reencode and not meta:
-            # Step 1: Try per-file NFO
-            nfo = find_nfo_for_video(file_path)
-            if nfo:
-                meta = read_nfo_as_meta(nfo)
-                logging.info("[RE-ENCODE] Loaded per-file meta from NFO: %s -> %s", nfo, meta.get("kind"))
-            # Step 2: Merge series-level IDs from tvshow.nfo
-            tvshow_nfo = find_tvshow_nfo(file_path)
-            if tvshow_nfo:
-                tvshow_meta = read_nfo_as_meta(tvshow_nfo)
-                if tvshow_meta:
-                    if not meta.get("series_imdb_id") and tvshow_meta.get("series_imdb_id"):
-                        meta["series_imdb_id"] = tvshow_meta["series_imdb_id"]
-                    if not meta.get("best_imdb_id") and tvshow_meta.get("best_imdb_id"):
-                        meta["best_imdb_id"] = tvshow_meta["best_imdb_id"]
-                    if not meta.get("series_tvdb_id") and tvshow_meta.get("series_tvdb_id"):
-                        meta["series_tvdb_id"] = tvshow_meta["series_tvdb_id"]
-                    if not meta.get("series_title") and tvshow_meta.get("series_title"):
-                        meta["series_title"] = tvshow_meta["series_title"]
-                    logging.info("[RE-ENCODE] Merged tvshow.nfo series IDs: imdb=%s tvdb=%s",
-                                 meta.get("series_imdb_id"), meta.get("series_tvdb_id"))
-            # Step 3: If meta is still empty, build full .meta.json from Radarr/Sonarr
-            if not meta:
-                logging.info("[RE-ENCODE] No NFO metadata found, building .meta.json from Radarr/Sonarr...")
-                arr_meta_path = build_meta_json_from_arr(file_path, s, temp_dir)
-                if arr_meta_path:
-                    logging.info("[RE-ENCODE] Built .meta.json in temp: %s", arr_meta_path)
-                    meta = load_unified_meta(temp_source) or {}
-                    _reencode_has_meta_json = True
-
-        # ---------- pick subtitles ----------
-        if is_reencode:
-            extracted_srt = _extract_embedded_to_dir(temp_source, temp_dir)
-        else:
-            extracted_srt = extract_embedded_subtitles(file_path)
-
-        # For re-encode with NFO-only meta (no .meta.json), pass meta_override
-        # so fetch_extra_subs can still find IMDB IDs. When we built a real
-        # .meta.json (step 3), let the normal file-based path handle it —
-        # this preserves full multi-episode logic (titles, per-ep IDs, etc.)
-        _meta_override = None
-        if is_reencode and meta and not _reencode_has_meta_json:
-            _meta_override = meta
-
-        working_video = temp_source if is_reencode else file_path
-
-        # ---------- resolve Auto preset rules ----------
-        from .auto_preset import resolve_auto_preset
-        settings_override = resolve_auto_preset(working_video, meta)
-
-        chosen_srt = pick_working_sub(
-            video_path=working_video,
-            initial_srt=extracted_srt or find_subtitle_file(working_video),
-            max_offset=FFSUBSYNC_MAX_OFFSET,
-            max_retries=MAX_RETRIES,
-            min_improvement=MIN_IMPROVEMENT,
-            meta_override=_meta_override,
-        )
-        if not chosen_srt:
-            from .config import get_setting
-            _req_val = (settings_override or {}).get("REQUIRE_SUBTITLES") or get_setting("REQUIRE_SUBTITLES", "true")
-            require_subs = str(_req_val).lower() == "true"
-            if require_subs:
-                if not is_reencode:
-                    with contextlib.suppress(Exception):
-                        with open(sentinel_path, "w") as f:
-                            f.write("no aligned/sane subs available\n")
-                    logging.warning(f"[SENTINEL] Created: {sentinel_path}")
-                logging.warning("[SUBPICK] No aligned/sane subtitles available — skipping this title for now.")
-                return
-            else:
-                logging.warning("[SUBPICK] No subtitles available — proceeding without subs (REQUIRE_SUBTITLES=false).")
-
-        # ---------- NEW: ep-code sanity between src & chosen_srt ----------
-        ep_sub = get_ep_code(chosen_srt)
-        if ep_src and ep_sub and ep_src != ep_sub:
-            logging.warning(f"[SANITY] ep mismatch: video={ep_src} sub={ep_sub} -> aborting transcode for safety")
+        _prep_transcode(ctx)
+        if ctx.abort:
             return
-
-        logging.info(f"[SUBPICK] Final subtitle used: {os.path.basename(chosen_srt)}")
-
-        # ---------- create progress file and poster BEFORE transcoding ----------
-        try:
-            _write_initial_progress(progress_file, file_path, meta, temp_dir)
-        except Exception as e:
-            logging.debug("[PROGRESS] Failed to write initial progress file: %s", e)
-
-        # ---------- transcode to temp (NEVER to final) ----------
-        # remove any stale tmp
-        with contextlib.suppress(Exception):
-            if os.path.exists(tmp_path): os.remove(tmp_path)
-
-        ffmpeg_input = temp_source if is_reencode else file_path
-        run_ffmpeg(ffmpeg_input, chosen_srt, tmp_path, base_name, s, progress_file,
-                   register_path=file_path if is_reencode else "",
-                   settings_override=settings_override)
-
-        # ---------- verify tmp BEFORE promotion ----------
-        if not verify_output(ffmpeg_input, tmp_path, chosen_srt, require_subs=bool(chosen_srt)):
-            logging.warning("[FINALIZE] Verification failed; keeping source and leaving tmp for inspection.")
+        if not _execute_transcode(
+            ctx.ffmpeg_input, ctx.chosen_srt, ctx.tmp_path, ctx.base_name,
+            ctx.s, ctx.progress_file,
+            settings_override=ctx.settings_override,
+            register_path=(ctx.file_path if ctx.is_reencode else ""),
+        ):
             return
-
-        # ---------- promote to output ----------
-        # Copy to staging file on destination FS, then atomic rename in-place
-        logging.info(f"[FINALIZE] Moving to final: {final_path}")
-        os.makedirs(output_dir, exist_ok=True)
-        staging_path = final_path + ".staging"
-        shutil.copy2(tmp_path, staging_path)
-        os.replace(staging_path, final_path)
-        os.remove(tmp_path)
-        logging.info(f"[FINALIZE] Transcoded and moved to: {final_path}")
-
-        # ---------- save transcode metadata to database ----------
-        try:
-            # Explicit import: `from transcodarr_core import *` (top of module) runs
-            # during package init before __init__ binds this name, so the star import
-            # misses it and a bare reference NameErrors at runtime — which silently
-            # disabled transcode-history recording (and the circuit breaker with it).
-            from .database import add_transcode_history
-            processing_duration = None
-            if os.path.exists(progress_file):
-                with open(progress_file, "r", encoding="utf-8") as f:
-                    prog_data = json.load(f)
-                started_at = prog_data.get("started_at")
-                if started_at:
-                    processing_duration = time.time() - started_at
-
-            source_size = os.path.getsize(file_path) if os.path.exists(file_path) else None
-            add_transcode_history(final_path, file_path, source_size, processing_duration, copied=False)
-            logging.info("[HISTORY] Recorded transcode: %s → %s", file_path, final_path)
-        except Exception as e:
-            logging.warning("[TRANSCODE-META] Failed to write history for %s: %s: %s",
-                            file_path, type(e).__name__, e)
-
-        # ---------- cleanup progress file ----------
-        with contextlib.suppress(Exception):
-            if os.path.exists(progress_file):
-                os.remove(progress_file)
-
-        # ---------- post-transcode: re-encode vs normal ----------
-        if is_reencode:
-            logging.info("[RE-ENCODE] Complete: %s", final_path)
-            # Write NFO if missing
-            if not find_nfo_for_video(final_path) and meta:
-                _write_nfo_for_reencode(meta, final_path)
-            # Write tvshow.nfo if TV and missing
-            if meta.get("kind") == "episode" and not find_tvshow_nfo(final_path):
-                series_dir = Path(final_path).parent.parent if "season" in Path(final_path).parent.name.lower() else Path(final_path).parent
-                write_tvshow_nfo_if_missing(
-                    str(series_dir),
-                    title=meta.get("series_title"),
-                    imdb_id=meta.get("series_imdb_id"),
-                    tvdb_id=meta.get("series_tvdb_id"),
-                    genres=meta.get("genres") or None,
-                )
-            # Generate poster if missing
-            poster_dir = str(Path(final_path).parent)
-            if meta.get("kind") == "episode":
-                show_dir = Path(final_path).parent.parent if "season" in Path(final_path).parent.name.lower() else Path(final_path).parent
-                poster_dir = str(show_dir)
-            if not (Path(poster_dir) / "poster.jpg").exists() and meta:
-                poster_meta = {}
-                if meta.get("kind") == "episode":
-                    poster_meta = {"imdb_id": meta.get("series_imdb_id"), "tvdb_id": meta.get("series_tvdb_id")}
-                    ensure_poster(poster_dir, kind="tv", meta=poster_meta)
-                else:
-                    poster_meta = {"imdb_id": meta.get("imdb_id"), "tmdb_id": meta.get("tmdb_id")}
-                    ensure_poster(poster_dir, kind="movie", meta=poster_meta)
-            # Delete old source file if extension changed (e.g. .mkv → .mp4)
-            if os.path.realpath(file_path) != os.path.realpath(final_path) and os.path.exists(file_path):
-                logging.info("[RE-ENCODE] Removing old source: %s", file_path)
-                with contextlib.suppress(Exception):
-                    os.remove(file_path)
-            # Clean up temp copy
-            if temp_source and os.path.exists(temp_source):
-                with contextlib.suppress(Exception):
-                    os.remove(temp_source)
-            refresh_library()
-        else:
-            # ---------- write compact NFO next to final ----------
-            meta_path = find_meta_json(file_path)
-            if meta_path:
-                write_nfo_from_meta(meta_path, final_path)
-
-            # ---------- write series root NFO under OUTPUT ----------
-            meta_path = find_meta_json(file_path)
-            series_root = None
-            series_meta = {}
-
-            if meta_path and os.path.exists(meta_path):
-                with open(meta_path, "r", encoding="utf-8", errors="replace") as f:
-                    raw = json.load(f)
-                series_meta = (raw.get("series") or {})
-                series_root = Path(final_path).parent.parent
-                logging.info("[TVROOT] series_root=%s", series_root)
-            else:
-                logging.warning("[META] no meta found next to %s for tvshow.nfo/poster", file_path)
-
-            if (meta.get("kind", "").lower() == "episode") and series_root:
-                write_tvshow_nfo(str(series_root), series_meta)
-                ensure_poster(str(series_root), kind="tv", meta=series_meta)
-            else:  # Movie
-                movie_dir = os.path.dirname(final_path)
-                m_meta = {}
-                try:
-                    if meta_path and os.path.exists(meta_path):
-                        with open(meta_path, "r", encoding="utf-8") as f:
-                            raw = json.load(f)
-                        m_meta = raw.get("movie") or {
-                            "imdb_id": raw.get("imdb_id"),
-                            "tmdb_id": (raw.get("tmdb_id") or None),
-                            "radarr_movie_id": (raw.get("radarr_movie_id") or None),
-                        }
-                except Exception:
-                    pass
-                ensure_poster(movie_dir, kind="movie", meta=m_meta)
-
-            # optional: library refresh
-            ok = refresh_library()
-            if ok:
-                logging.info("[JELLYFIN] Jellyfin refresh successful.")
-
-            # ---------- SAFE cleanup via Radarr/Sonarr ----------
-            ep_final = get_ep_code(final_path)
-            if os.path.exists(final_path):
-                if (ep_src is None) or (ep_final == ep_src):
-                    # remove folder-level nosub sentinel if present
-                    if os.path.exists(sentinel_path):
-                        with contextlib.suppress(Exception):
-                            os.remove(sentinel_path)
-
-                    meta = load_unified_meta(file_path)
-                    kind = (meta.get("kind") or "").lower()
-
-                    if kind == "movie":
-                        logging.info(f"[RADARR] Updating movie path to output: {final_path}")
-                        ok = update_movie_path(src_dir, final_path)
-                        if ok:
-                            logging.info("[RADARR] Path updated successfully. Cleaning up source folder.")
-                            with contextlib.suppress(Exception):
-                                shutil.rmtree(src_dir)
-                                logging.info(f"[CLEANUP] Removed source folder: {src_dir}")
-                        else:
-                            logging.warning("[RADARR] Path update failed; keeping source.")
-                    elif kind == "episode":
-                        from .sonarr import get_series_status, delete_episode_by_path
-
-                        status = get_series_status(file_path)
-                        if status:
-                            series_title = status["title"]
-                            is_last_episode = status["ended"] and status["episode_file_count"] == 1
-
-                            logging.info(f"[SONARR] Series '{series_title}': ended={status['ended']}, episode_file_count={status['episode_file_count']} (before delete)")
-
-                            delete_ok = delete_episode_by_path(file_path, delete_files=False)
-                            if delete_ok:
-                                logging.info(f"[SONARR] Deleted episode file record for: {file_path}")
-                            else:
-                                logging.warning(f"[SONARR] Failed to delete episode file record: {file_path}")
-
-                            if is_last_episode:
-                                logging.info(f"[SONARR] Last episode of ended series - updating path to output")
-                                path_ok = update_series_path(file_path, final_path)
-                                if path_ok:
-                                    logging.info(f"[SONARR] Series path updated to output: {final_path}")
-                                else:
-                                    logging.warning(f"[SONARR] Failed to update series path")
-                        else:
-                            logging.warning(f"[SONARR] Could not get series status for: {file_path}")
-
-                        logging.info("[CLEANUP] Removing source episode file.")
-                        with contextlib.suppress(Exception):
-                            os.remove(file_path)
-                            logging.info(f"[CLEANUP] Removed source file: {file_path}")
-                        meta_file = Path(file_path).with_suffix(".meta.json")
-                        if meta_file.exists():
-                            with contextlib.suppress(Exception):
-                                os.remove(meta_file)
-                        meta_pattern = Path(file_path).parent.glob(f"*{Path(file_path).stem}*.meta.json")
-                        for mf in meta_pattern:
-                            with contextlib.suppress(Exception):
-                                os.remove(mf)
-                    else:
-                        # Output was produced successfully but we can't classify the
-                        # source (no metadata → kind unknown), so cleanup can't safely
-                        # remove it. Ignore the source to prevent an infinite
-                        # re-transcode loop on every scan. See circuit breaker in
-                        # walk_and_process for the same self-healing intent.
-                        logging.warning(
-                            "[CLEANUP] Unknown kind for %s; output exists at %s. "
-                            "Adding source to ignore list to prevent re-transcode loop "
-                            "(investigate why metadata enrichment produced no kind).",
-                            file_path, final_path,
-                        )
-                        with contextlib.suppress(Exception):
-                            set_ignored(file_path, reason="cleanup: unknown kind (missing metadata); output already produced")
-                else:
-                    logging.warning(f"[CLEANUP] ep mismatch at finalize (src={ep_src}, final={ep_final}); keeping source.")
-            else:
-                logging.warning("[CLEANUP] Final file or .ok marker missing; keeping source.")
-
+        _post_transcode(ctx)
     except Exception as e:
         logging.error(f"Failed to transcode {file_path}: {e}")
         logging.error(traceback.format_exc())
     finally:
-        # Best-effort cleanup of temp artifacts
+        _cleanup_transcode(ctx)
+
+
+def _prep_transcode(ctx: "TranscodeContext") -> None:
+    """PREP: everything the master must do before ffmpeg — re-encode detection,
+    metadata enrichment, path calc, subtitle pick, Auto-preset resolution. Populates
+    ctx; sets ctx.abort=True to skip the title cleanly (no usable subs / ep mismatch)."""
+    s = ctx.s
+    file_path = ctx.file_path
+    from .config import get_media_paths
+    _mpaths = get_media_paths(s)
+    base_name   = os.path.splitext(os.path.basename(file_path))[0]
+    src_dir   = os.path.dirname(file_path)
+
+    # ---------- detect re-encode (source lives inside any output path) ----------
+    _src_resolved = os.path.realpath(file_path)
+    is_reencode = any(
+        _src_resolved.startswith(os.path.realpath(p) + os.sep)
+        for p in [_mpaths["movies_output"], _mpaths["tv_output"]]
+    )
+
+    if is_reencode:
+        logging.info("[RE-ENCODE] Detected re-encode for: %s", file_path)
+
+    # NEW: run enrichment for TV episodes before we pick subtitles
+    if not is_reencode:
+        try:
+            meta = load_unified_meta(file_path) or {}
+            if not meta:
+                # No sidecar next to the media — the external write_meta script
+                # didn't run, or the episode title contains characters it choked
+                # on (e.g. "ronny/lily"). Build one from Radarr/Sonarr by path and
+                # persist it next to the source so downstream NFO/poster AND source
+                # cleanup can classify the file. Without this, cleanup hits
+                # "Unknown kind", never removes the source, and the watchdog
+                # re-transcodes it on every scan.
+                built = build_meta_json_from_arr(file_path, s, src_dir)
+                if built:
+                    meta = load_unified_meta(file_path) or {}
+                    logging.info("[ENRICH] Built sidecar from Radarr/Sonarr path lookup: %s", built)
+                else:
+                    logging.warning("[ENRICH] No sidecar and no Radarr/Sonarr match for: %s", file_path)
+            if (meta.get("kind") or "").lower() == "episode":
+                enrich_episode_ids(file_path)  # writes back to .meta.json if needed
+        except Exception as e:
+            logging.debug("[ENRICH] skipped: %s", e)
+    else:
+        meta = {}
+
+    ep_src = get_ep_code(file_path)  # NEW: remember source ep (None for movies)
+
+    # ---------- path calculation (branched for re-encode) ----------
+    temp_root = s.MEDIA_TEMP_FOLDER or "/temp"
+    if is_reencode:
+        # Determine which output path this file is under
+        _media_type = "movies"
+        for _okey, _mtype in [("movies_output", "movies"), ("tv_output", "tv")]:
+            _oresolved = os.path.realpath(_mpaths[_okey])
+            if _src_resolved.startswith(_oresolved + os.sep):
+                relative_dir = os.path.relpath(src_dir, _mpaths[_okey])
+                _media_type = _mtype
+                break
+        else:
+            relative_dir = os.path.basename(src_dir)
+        output_dir = src_dir
+        temp_dir = os.path.join(temp_root, "_reencode", _media_type, relative_dir)
+    else:
+        # Determine output dir from configured media paths
+        _fp = file_path.replace(os.sep, "/")
+        if _fp.startswith(_mpaths["movies_watch"]):
+            relative_dir = os.path.relpath(src_dir, _mpaths["movies_watch"])
+            output_dir = os.path.join(_mpaths["movies_output"], relative_dir)
+            _media_type = "movies"
+        elif _fp.startswith(_mpaths["tv_watch"]):
+            relative_dir = os.path.relpath(src_dir, _mpaths["tv_watch"])
+            output_dir = os.path.join(_mpaths["tv_output"], relative_dir)
+            _media_type = "tv"
+        else:
+            relative_dir = os.path.basename(src_dir)
+            output_dir = os.path.join(_mpaths["movies_output"], relative_dir)
+            _media_type = "movies"
+            logging.warning("[TRANSCODE] File not under any configured watch path, defaulting to movies output: %s", file_path)
+        temp_dir = os.path.join(temp_root, _media_type, relative_dir)
+
+    os.makedirs(temp_dir, exist_ok=True)
+
+    # Pack cleanup/routing state onto ctx as soon as it is known, so a later
+    # failure (or a clean abort below) still lets _cleanup_transcode find the
+    # temp artifacts. Remaining fields are packed as they are computed.
+    ctx.base_name = base_name
+    ctx.src_dir = src_dir
+    ctx.is_reencode = is_reencode
+    ctx.temp_root = temp_root
+    ctx.temp_dir = temp_dir
+    ctx.output_dir = output_dir
+
+    # Copy source video to temp for re-encode so OUTPUT stays clean
+    if is_reencode:
+        temp_source = os.path.join(temp_dir, os.path.basename(file_path))
+        ctx.temp_source = temp_source
+        if not os.path.exists(temp_source):
+            logging.info("[RE-ENCODE] Copying source to temp: %s -> %s", file_path, temp_source)
+            shutil.copy2(file_path, temp_source)
+    else:
+        temp_source = None
+        ctx.temp_source = temp_source
+
+    container     = s.TARGET_CONTAINER or ".mp4"
+    tmp_path      = os.path.join(temp_dir, base_name + ".tmp" + container)
+    progress_file = os.path.join(temp_dir, base_name + ".progress.json")
+    final_path    = os.path.join(output_dir, base_name + container)
+    ok_marker     = os.path.join(output_dir, f".{base_name}.ok")
+
+    ctx.tmp_path = tmp_path
+    ctx.progress_file = progress_file
+    ctx.final_path = final_path
+    ctx.ok_marker = ok_marker
+
+    # ---------- sentinel handling (skip for re-encode) ----------
+    sentinel_path = os.path.join(src_dir, SENTINEL_NAME)
+    ctx.sentinel_path = sentinel_path
+    if not is_reencode and os.path.exists(sentinel_path):
+        logging.info(f"[SENTINEL] Removing stale sentinel: {sentinel_path}")
         with contextlib.suppress(Exception):
-            if os.path.exists(tmp_path):
-                os.remove(tmp_path)
-        # Clean up progress file (may have been removed already in happy path)
-        with contextlib.suppress(Exception):
-            if os.path.exists(progress_file):
-                os.remove(progress_file)
-        # Clean up extracted SRT and synced variants from temp_dir (re-encode mode)
-        with contextlib.suppress(Exception):
+            os.remove(sentinel_path)
+
+    # ---------- thresholds (unchanged) ----------
+    try:
+        FFSUBSYNC_MAX_OFFSET = float(os.getenv("FFSUBSYNC_MAX_OFFSET", "0.5"))
+    except Exception:
+        FFSUBSYNC_MAX_OFFSET = 0.5
+    MAX_RETRIES     = int(os.getenv("FFSUBSYNC_MAX_RETRIES", "5"))
+    MIN_IMPROVEMENT = float(os.getenv("FFSUBSYNC_MIN_IMPROVEMENT", "0.5"))
+
+    # ---------- NFO metadata fallback for re-encode ----------
+    # Track whether we have a real .meta.json file (not just NFO-derived dict)
+    _reencode_has_meta_json = False
+    if is_reencode and not meta:
+        # Step 1: Try per-file NFO
+        nfo = find_nfo_for_video(file_path)
+        if nfo:
+            meta = read_nfo_as_meta(nfo)
+            logging.info("[RE-ENCODE] Loaded per-file meta from NFO: %s -> %s", nfo, meta.get("kind"))
+        # Step 2: Merge series-level IDs from tvshow.nfo
+        tvshow_nfo = find_tvshow_nfo(file_path)
+        if tvshow_nfo:
+            tvshow_meta = read_nfo_as_meta(tvshow_nfo)
+            if tvshow_meta:
+                if not meta.get("series_imdb_id") and tvshow_meta.get("series_imdb_id"):
+                    meta["series_imdb_id"] = tvshow_meta["series_imdb_id"]
+                if not meta.get("best_imdb_id") and tvshow_meta.get("best_imdb_id"):
+                    meta["best_imdb_id"] = tvshow_meta["best_imdb_id"]
+                if not meta.get("series_tvdb_id") and tvshow_meta.get("series_tvdb_id"):
+                    meta["series_tvdb_id"] = tvshow_meta["series_tvdb_id"]
+                if not meta.get("series_title") and tvshow_meta.get("series_title"):
+                    meta["series_title"] = tvshow_meta["series_title"]
+                logging.info("[RE-ENCODE] Merged tvshow.nfo series IDs: imdb=%s tvdb=%s",
+                             meta.get("series_imdb_id"), meta.get("series_tvdb_id"))
+        # Step 3: If meta is still empty, build full .meta.json from Radarr/Sonarr
+        if not meta:
+            logging.info("[RE-ENCODE] No NFO metadata found, building .meta.json from Radarr/Sonarr...")
+            arr_meta_path = build_meta_json_from_arr(file_path, s, temp_dir)
+            if arr_meta_path:
+                logging.info("[RE-ENCODE] Built .meta.json in temp: %s", arr_meta_path)
+                meta = load_unified_meta(temp_source) or {}
+                _reencode_has_meta_json = True
+
+    # ---------- pick subtitles ----------
+    if is_reencode:
+        extracted_srt = _extract_embedded_to_dir(temp_source, temp_dir)
+    else:
+        extracted_srt = extract_embedded_subtitles(file_path)
+
+    # For re-encode with NFO-only meta (no .meta.json), pass meta_override
+    # so fetch_extra_subs can still find IMDB IDs. When we built a real
+    # .meta.json (step 3), let the normal file-based path handle it —
+    # this preserves full multi-episode logic (titles, per-ep IDs, etc.)
+    _meta_override = None
+    if is_reencode and meta and not _reencode_has_meta_json:
+        _meta_override = meta
+
+    working_video = temp_source if is_reencode else file_path
+
+    # ---------- resolve Auto preset rules ----------
+    from .auto_preset import resolve_auto_preset
+    settings_override = resolve_auto_preset(working_video, meta)
+
+    chosen_srt = pick_working_sub(
+        video_path=working_video,
+        initial_srt=extracted_srt or find_subtitle_file(working_video),
+        max_offset=FFSUBSYNC_MAX_OFFSET,
+        max_retries=MAX_RETRIES,
+        min_improvement=MIN_IMPROVEMENT,
+        meta_override=_meta_override,
+    )
+    if not chosen_srt:
+        from .config import get_setting
+        _req_val = (settings_override or {}).get("REQUIRE_SUBTITLES") or get_setting("REQUIRE_SUBTITLES", "true")
+        require_subs = str(_req_val).lower() == "true"
+        if require_subs:
+            if not is_reencode:
+                with contextlib.suppress(Exception):
+                    with open(sentinel_path, "w") as f:
+                        f.write("no aligned/sane subs available\n")
+                logging.warning(f"[SENTINEL] Created: {sentinel_path}")
+            logging.warning("[SUBPICK] No aligned/sane subtitles available — skipping this title for now.")
+            ctx.abort = True
+            return
+        else:
+            logging.warning("[SUBPICK] No subtitles available — proceeding without subs (REQUIRE_SUBTITLES=false).")
+
+    # ---------- NEW: ep-code sanity between src & chosen_srt ----------
+    ep_sub = get_ep_code(chosen_srt)
+    if ep_src and ep_sub and ep_src != ep_sub:
+        logging.warning(f"[SANITY] ep mismatch: video={ep_src} sub={ep_sub} -> aborting transcode for safety")
+        ctx.abort = True
+        return
+
+    logging.info(f"[SUBPICK] Final subtitle used: {os.path.basename(chosen_srt)}")
+
+    # ---------- create progress file and poster BEFORE transcoding ----------
+    try:
+        _write_initial_progress(progress_file, file_path, meta, temp_dir)
+    except Exception as e:
+        logging.debug("[PROGRESS] Failed to write initial progress file: %s", e)
+
+    # ---------- transcode to temp (NEVER to final) ----------
+    # remove any stale tmp
+    with contextlib.suppress(Exception):
+        if os.path.exists(tmp_path): os.remove(tmp_path)
+
+    ffmpeg_input = temp_source if is_reencode else file_path
+
+    # Pack the remaining prep results that execute/post consume.
+    ctx.meta = meta
+    ctx.ep_src = ep_src
+    ctx.settings_override = settings_override
+    ctx.chosen_srt = chosen_srt
+    ctx.ffmpeg_input = ffmpeg_input
+
+def _execute_transcode(ffmpeg_input, chosen_srt, tmp_out, base_name, s, progress_file,
+                       settings_override=None, register_path=""):
+    """EXECUTE: pure ffmpeg. Transcode to the temp path on shared storage, then
+    verify. This is the whole node-side job in Phase 2 — it takes explicit args (the
+    node job payload), not the master's context. Returns True iff the output verified."""
+    run_ffmpeg(ffmpeg_input, chosen_srt, tmp_out, base_name, s, progress_file,
+               register_path=register_path,
+               settings_override=settings_override)
+    if not verify_output(ffmpeg_input, tmp_out, chosen_srt, require_subs=bool(chosen_srt)):
+        logging.warning("[FINALIZE] Verification failed; keeping source and leaving tmp for inspection.")
+        return False
+    return True
+
+
+def _post_transcode(ctx: "TranscodeContext") -> None:
+    """POST: promote temp->final, record history, write NFO/poster, update
+    Radarr/Sonarr paths + clean up the source, refresh Jellyfin."""
+    s = ctx.s
+    file_path = ctx.file_path
+    is_reencode = ctx.is_reencode
+    meta = ctx.meta
+    ep_src = ctx.ep_src
+    src_dir = ctx.src_dir
+    output_dir = ctx.output_dir
+    temp_source = ctx.temp_source
+    tmp_path = ctx.tmp_path
+    progress_file = ctx.progress_file
+    final_path = ctx.final_path
+    sentinel_path = ctx.sentinel_path
+    # ---------- promote to output ----------
+    # Copy to staging file on destination FS, then atomic rename in-place
+    logging.info(f"[FINALIZE] Moving to final: {final_path}")
+    os.makedirs(output_dir, exist_ok=True)
+    staging_path = final_path + ".staging"
+    shutil.copy2(tmp_path, staging_path)
+    os.replace(staging_path, final_path)
+    os.remove(tmp_path)
+    logging.info(f"[FINALIZE] Transcoded and moved to: {final_path}")
+
+    # ---------- save transcode metadata to database ----------
+    try:
+        # Explicit import: `from transcodarr_core import *` (top of module) runs
+        # during package init before __init__ binds this name, so the star import
+        # misses it and a bare reference NameErrors at runtime — which silently
+        # disabled transcode-history recording (and the circuit breaker with it).
+        from .database import add_transcode_history
+        processing_duration = None
+        if os.path.exists(progress_file):
+            with open(progress_file, "r", encoding="utf-8") as f:
+                prog_data = json.load(f)
+            started_at = prog_data.get("started_at")
+            if started_at:
+                processing_duration = time.time() - started_at
+
+        source_size = os.path.getsize(file_path) if os.path.exists(file_path) else None
+        add_transcode_history(final_path, file_path, source_size, processing_duration, copied=False)
+        logging.info("[HISTORY] Recorded transcode: %s → %s", file_path, final_path)
+    except Exception as e:
+        logging.warning("[TRANSCODE-META] Failed to write history for %s: %s: %s",
+                        file_path, type(e).__name__, e)
+
+    # ---------- cleanup progress file ----------
+    with contextlib.suppress(Exception):
+        if os.path.exists(progress_file):
+            os.remove(progress_file)
+
+    # ---------- post-transcode: re-encode vs normal ----------
+    if is_reencode:
+        logging.info("[RE-ENCODE] Complete: %s", final_path)
+        # Write NFO if missing
+        if not find_nfo_for_video(final_path) and meta:
+            _write_nfo_for_reencode(meta, final_path)
+        # Write tvshow.nfo if TV and missing
+        if meta.get("kind") == "episode" and not find_tvshow_nfo(final_path):
+            series_dir = Path(final_path).parent.parent if "season" in Path(final_path).parent.name.lower() else Path(final_path).parent
+            write_tvshow_nfo_if_missing(
+                str(series_dir),
+                title=meta.get("series_title"),
+                imdb_id=meta.get("series_imdb_id"),
+                tvdb_id=meta.get("series_tvdb_id"),
+                genres=meta.get("genres") or None,
+            )
+        # Generate poster if missing
+        poster_dir = str(Path(final_path).parent)
+        if meta.get("kind") == "episode":
+            show_dir = Path(final_path).parent.parent if "season" in Path(final_path).parent.name.lower() else Path(final_path).parent
+            poster_dir = str(show_dir)
+        if not (Path(poster_dir) / "poster.jpg").exists() and meta:
+            poster_meta = {}
+            if meta.get("kind") == "episode":
+                poster_meta = {"imdb_id": meta.get("series_imdb_id"), "tvdb_id": meta.get("series_tvdb_id")}
+                ensure_poster(poster_dir, kind="tv", meta=poster_meta)
+            else:
+                poster_meta = {"imdb_id": meta.get("imdb_id"), "tmdb_id": meta.get("tmdb_id")}
+                ensure_poster(poster_dir, kind="movie", meta=poster_meta)
+        # Delete old source file if extension changed (e.g. .mkv → .mp4)
+        if os.path.realpath(file_path) != os.path.realpath(final_path) and os.path.exists(file_path):
+            logging.info("[RE-ENCODE] Removing old source: %s", file_path)
+            with contextlib.suppress(Exception):
+                os.remove(file_path)
+        # Clean up temp copy
+        if temp_source and os.path.exists(temp_source):
+            with contextlib.suppress(Exception):
+                os.remove(temp_source)
+        refresh_library()
+    else:
+        # ---------- write compact NFO next to final ----------
+        meta_path = find_meta_json(file_path)
+        if meta_path:
+            write_nfo_from_meta(meta_path, final_path)
+
+        # ---------- write series root NFO under OUTPUT ----------
+        meta_path = find_meta_json(file_path)
+        series_root = None
+        series_meta = {}
+
+        if meta_path and os.path.exists(meta_path):
+            with open(meta_path, "r", encoding="utf-8", errors="replace") as f:
+                raw = json.load(f)
+            series_meta = (raw.get("series") or {})
+            series_root = Path(final_path).parent.parent
+            logging.info("[TVROOT] series_root=%s", series_root)
+        else:
+            logging.warning("[META] no meta found next to %s for tvshow.nfo/poster", file_path)
+
+        if (meta.get("kind", "").lower() == "episode") and series_root:
+            write_tvshow_nfo(str(series_root), series_meta)
+            ensure_poster(str(series_root), kind="tv", meta=series_meta)
+        else:  # Movie
+            movie_dir = os.path.dirname(final_path)
+            m_meta = {}
+            try:
+                if meta_path and os.path.exists(meta_path):
+                    with open(meta_path, "r", encoding="utf-8") as f:
+                        raw = json.load(f)
+                    m_meta = raw.get("movie") or {
+                        "imdb_id": raw.get("imdb_id"),
+                        "tmdb_id": (raw.get("tmdb_id") or None),
+                        "radarr_movie_id": (raw.get("radarr_movie_id") or None),
+                    }
+            except Exception:
+                pass
+            ensure_poster(movie_dir, kind="movie", meta=m_meta)
+
+        # optional: library refresh
+        ok = refresh_library()
+        if ok:
+            logging.info("[JELLYFIN] Jellyfin refresh successful.")
+
+        # ---------- SAFE cleanup via Radarr/Sonarr ----------
+        ep_final = get_ep_code(final_path)
+        if os.path.exists(final_path):
+            if (ep_src is None) or (ep_final == ep_src):
+                # remove folder-level nosub sentinel if present
+                if os.path.exists(sentinel_path):
+                    with contextlib.suppress(Exception):
+                        os.remove(sentinel_path)
+
+                meta = load_unified_meta(file_path)
+                kind = (meta.get("kind") or "").lower()
+
+                if kind == "movie":
+                    logging.info(f"[RADARR] Updating movie path to output: {final_path}")
+                    ok = update_movie_path(src_dir, final_path)
+                    if ok:
+                        logging.info("[RADARR] Path updated successfully. Cleaning up source folder.")
+                        with contextlib.suppress(Exception):
+                            shutil.rmtree(src_dir)
+                            logging.info(f"[CLEANUP] Removed source folder: {src_dir}")
+                    else:
+                        logging.warning("[RADARR] Path update failed; keeping source.")
+                elif kind == "episode":
+                    from .sonarr import get_series_status, delete_episode_by_path
+
+                    status = get_series_status(file_path)
+                    if status:
+                        series_title = status["title"]
+                        is_last_episode = status["ended"] and status["episode_file_count"] == 1
+
+                        logging.info(f"[SONARR] Series '{series_title}': ended={status['ended']}, episode_file_count={status['episode_file_count']} (before delete)")
+
+                        delete_ok = delete_episode_by_path(file_path, delete_files=False)
+                        if delete_ok:
+                            logging.info(f"[SONARR] Deleted episode file record for: {file_path}")
+                        else:
+                            logging.warning(f"[SONARR] Failed to delete episode file record: {file_path}")
+
+                        if is_last_episode:
+                            logging.info(f"[SONARR] Last episode of ended series - updating path to output")
+                            path_ok = update_series_path(file_path, final_path)
+                            if path_ok:
+                                logging.info(f"[SONARR] Series path updated to output: {final_path}")
+                            else:
+                                logging.warning(f"[SONARR] Failed to update series path")
+                    else:
+                        logging.warning(f"[SONARR] Could not get series status for: {file_path}")
+
+                    logging.info("[CLEANUP] Removing source episode file.")
+                    with contextlib.suppress(Exception):
+                        os.remove(file_path)
+                        logging.info(f"[CLEANUP] Removed source file: {file_path}")
+                    meta_file = Path(file_path).with_suffix(".meta.json")
+                    if meta_file.exists():
+                        with contextlib.suppress(Exception):
+                            os.remove(meta_file)
+                    meta_pattern = Path(file_path).parent.glob(f"*{Path(file_path).stem}*.meta.json")
+                    for mf in meta_pattern:
+                        with contextlib.suppress(Exception):
+                            os.remove(mf)
+                else:
+                    # Output was produced successfully but we can't classify the
+                    # source (no metadata → kind unknown), so cleanup can't safely
+                    # remove it. Ignore the source to prevent an infinite
+                    # re-transcode loop on every scan. See circuit breaker in
+                    # walk_and_process for the same self-healing intent.
+                    logging.warning(
+                        "[CLEANUP] Unknown kind for %s; output exists at %s. "
+                        "Adding source to ignore list to prevent re-transcode loop "
+                        "(investigate why metadata enrichment produced no kind).",
+                        file_path, final_path,
+                    )
+                    with contextlib.suppress(Exception):
+                        set_ignored(file_path, reason="cleanup: unknown kind (missing metadata); output already produced")
+            else:
+                logging.warning(f"[CLEANUP] ep mismatch at finalize (src={ep_src}, final={ep_final}); keeping source.")
+        else:
+            logging.warning("[CLEANUP] Final file or .ok marker missing; keeping source.")
+
+def _cleanup_transcode(ctx: "TranscodeContext") -> None:
+    """Best-effort removal of temp artifacts. Fields may be None if prep aborted
+    early, so each step is guarded — matching the original finally block, which
+    already suppressed everything here."""
+    tmp_path = ctx.tmp_path
+    progress_file = ctx.progress_file
+    temp_dir = ctx.temp_dir
+    temp_root = ctx.temp_root
+    base_name = ctx.base_name
+    is_reencode = ctx.is_reencode
+    temp_source = ctx.temp_source
+    with contextlib.suppress(Exception):
+        if tmp_path and os.path.exists(tmp_path):
+            os.remove(tmp_path)
+    with contextlib.suppress(Exception):
+        if progress_file and os.path.exists(progress_file):
+            os.remove(progress_file)
+    with contextlib.suppress(Exception):
+        if temp_dir:
             for f in Path(temp_dir).glob(f"{base_name}*.srt"):
                 os.remove(f)
-        # Clean up temp source copy for re-encode
-        if is_reencode and temp_source:
-            with contextlib.suppress(Exception):
-                if os.path.exists(temp_source):
-                    os.remove(temp_source)
-                    logging.debug("[RE-ENCODE] Cleaned up temp source copy: %s", temp_source)
+    if is_reencode and temp_source:
+        with contextlib.suppress(Exception):
+            if os.path.exists(temp_source):
+                os.remove(temp_source)
+                logging.debug("[RE-ENCODE] Cleaned up temp source copy: %s", temp_source)
+    if temp_dir:
         _prune_empty_dirs(temp_dir, temp_root)
+
 
 
 # -------------------------------------------------------------------

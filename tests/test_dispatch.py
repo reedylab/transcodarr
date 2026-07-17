@@ -190,3 +190,45 @@ def test_try_dispatch_hw_job_without_capable_node_runs_local():
     cluster.register_node("sw", "10.0.0.1", caps(), 2, True)  # software only
     assert dispatch.try_dispatch(_ctx(dispatch_enabled=True, backend="nvenc")) is False
     assert dispatch.snapshot()["pending_count"] == 0
+
+
+# ---- master-side completion (step 4): finalize / discard ----
+
+def _fin_ctx():
+    return SimpleNamespace(ffmpeg_input="/output/movies/A/A.mkv", tmp_path="/temp/A.tmp.mp4",
+                           chosen_srt=None, file_path="/output/movies/A/A.mkv")
+
+
+def test_finalize_verifies_then_posts_then_cleans(monkeypatch):
+    import transcodarr_core.pipeline as p
+    order = []
+    monkeypatch.setattr(p, "verify_output", lambda *a, **k: True)
+    monkeypatch.setattr(p, "_post_transcode", lambda c: order.append("post"))
+    monkeypatch.setattr(p, "_cleanup_transcode", lambda c: order.append("cleanup"))
+    assert p.finalize_dispatched_job(_fin_ctx()) is True
+    assert order == ["post", "cleanup"]
+
+
+def test_finalize_failed_verify_skips_post_but_cleans(monkeypatch):
+    import transcodarr_core.pipeline as p
+    order = []
+    monkeypatch.setattr(p, "verify_output", lambda *a, **k: False)
+    monkeypatch.setattr(p, "_post_transcode", lambda c: order.append("post"))
+    monkeypatch.setattr(p, "_cleanup_transcode", lambda c: order.append("cleanup"))
+    assert p.finalize_dispatched_job(_fin_ctx()) is False
+    assert order == ["cleanup"]           # promoted nothing, but temp cleaned
+
+
+def test_finalize_none_ctx_is_safe():
+    import transcodarr_core.pipeline as p
+    assert p.finalize_dispatched_job(None) is False
+
+
+def test_discard_cleans_temp(monkeypatch):
+    import transcodarr_core.pipeline as p
+    cleaned = []
+    monkeypatch.setattr(p, "_cleanup_transcode", lambda c: cleaned.append(c))
+    ctx = _fin_ctx()
+    p.discard_dispatched_job(ctx)
+    p.discard_dispatched_job(None)        # no-op, no crash
+    assert cleaned == [ctx]

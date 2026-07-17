@@ -6,9 +6,13 @@ All endpoints are node-initiated and bearer-authenticated with NODE_TOKEN. A
 master only accepts nodes when it has TRANSCODARR_MODE=master and a NODE_TOKEN set;
 otherwise clustering is effectively off and registrations are refused.
 
-Dispatch (handing a job back in the heartbeat reply) is Phase 2 — for now the
-heartbeat reply carries no work.
+The heartbeat reply may carry a job assignment; a node then executes it on shared
+storage and reports back via the /cluster/job/{id}/{progress,complete,failed}
+endpoints, where the master runs post-processing.
 """
+import logging
+import threading
+
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
@@ -80,6 +84,56 @@ async def api_cluster_deregister(request: Request):
     body = await request.json()
     cluster.remove_node(body.get("node_id"))
     return {"status": "deregistered"}
+
+
+@router.post("/cluster/job/{job_id}/progress")
+async def api_job_progress(job_id: str, request: Request):
+    """A node streams encode progress (0-100) for a job it is running."""
+    ok, err = _auth(request)
+    if not ok:
+        return err
+    body = await request.json()
+    dispatch.mark_progress(job_id, body.get("progress"))
+    return {"status": "ok"}
+
+
+def _finalize_job(job: dict) -> None:
+    """Run master post-processing for a node-completed job off the request thread."""
+    from transcodarr_core.pipeline import finalize_dispatched_job
+    finalize_dispatched_job(job.get("ctx"))
+
+
+@router.post("/cluster/job/{job_id}/complete")
+async def api_job_complete(job_id: str, request: Request):
+    """A node reports a job finished + verified. The master promotes the output and
+    finishes post-processing (history, Radarr/Sonarr, Jellyfin) in the background."""
+    ok, err = _auth(request)
+    if not ok:
+        return err
+    job = dispatch.complete(job_id)
+    if not job:
+        return JSONResponse({"status": "unknown job"}, status_code=404)
+    threading.Thread(target=_finalize_job, args=(job,), daemon=True,
+                     name=f"finalize-{job_id}").start()
+    return {"status": "accepted"}
+
+
+@router.post("/cluster/job/{job_id}/failed")
+async def api_job_failed(job_id: str, request: Request):
+    """A node reports a job failed. Drop its partial temp output; source is left intact
+    so the watchdog re-processes the title later."""
+    ok, err = _auth(request)
+    if not ok:
+        return err
+    body = await request.json()
+    job = dispatch.fail(job_id, requeue=False)
+    if job:
+        logging.warning("[CLUSTER] node %r reported job %s failed: %s",
+                        job.get("node_id"), job_id, body.get("error") or "")
+        from transcodarr_core.pipeline import discard_dispatched_job
+        threading.Thread(target=discard_dispatched_job, args=(job.get("ctx"),),
+                         daemon=True, name=f"discard-{job_id}").start()
+    return {"status": "ok"}
 
 
 @router.get("/node/status")

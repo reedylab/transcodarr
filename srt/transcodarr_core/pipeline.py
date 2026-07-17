@@ -809,6 +809,37 @@ def _execute_transcode(ffmpeg_input, chosen_srt, tmp_out, base_name, s, progress
     return True
 
 
+def finalize_dispatched_job(ctx) -> bool:
+    """Master-side completion for a job a node executed (Phase 2 step 4). The node wrote
+    ctx.tmp_path on shared storage and reported success; the master re-verifies (belt and
+    suspenders), then runs POST (promote/history/arr/jellyfin) and cleanup — exactly what
+    the local orchestrator does after EXECUTE. Returns True if the output was promoted."""
+    if ctx is None:
+        logging.warning("[DISPATCH] completion arrived with no context — cannot finalize")
+        return False
+    try:
+        if not verify_output(ctx.ffmpeg_input, ctx.tmp_path, ctx.chosen_srt,
+                             require_subs=bool(ctx.chosen_srt)):
+            logging.warning("[DISPATCH] node output failed master verify; keeping source: %s",
+                            ctx.file_path)
+            return False
+        _post_transcode(ctx)
+        return True
+    except Exception as e:
+        logging.error("[DISPATCH] finalize failed for %s: %s", getattr(ctx, "file_path", "?"), e)
+        logging.error(traceback.format_exc())
+        return False
+    finally:
+        _cleanup_transcode(ctx)
+
+
+def discard_dispatched_job(ctx) -> None:
+    """A node reported failure — drop its partial temp output. The source is left intact,
+    so the watchdog will re-detect and re-process the title on a later scan."""
+    if ctx is not None:
+        _cleanup_transcode(ctx)
+
+
 def _post_transcode(ctx: "TranscodeContext") -> None:
     """POST: promote temp->final, record history, write NFO/poster, update
     Radarr/Sonarr paths + clean up the source, refresh Jellyfin."""

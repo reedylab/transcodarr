@@ -4,16 +4,19 @@ Node-side agent. In TRANSCODARR_MODE=node, this connects out to the master:
 probe local hardware, verify shared storage, register, then heartbeat.
 
 Node-initiated by design — the master never dials the node, so this works behind
-NAT and needs no inbound ports. Dispatch (acting on a job handed back in the
-heartbeat reply) is Phase 2; for now the agent just keeps the node present in the
-master's registry with its capabilities and worker count.
+NAT and needs no inbound ports. When the heartbeat reply carries a job assignment,
+the agent runs the pure-ffmpeg EXECUTE phase on the shared storage, streams progress
+back, and reports completion/failure so the master can post-process.
 """
 from __future__ import annotations
 
+import contextlib
+import json
 import logging
 import os
 import socket
 import threading
+from concurrent.futures import ThreadPoolExecutor
 
 import requests
 
@@ -37,6 +40,10 @@ class NodeAgent:
         self._thread: threading.Thread | None = None
         self._interval = 5.0
         self._registered = False
+        # Jobs this node is currently executing: job_id -> last progress (0-100).
+        self._jobs: dict[str, float] = {}
+        self._jobs_lock = threading.Lock()
+        self._executor: ThreadPoolExecutor | None = None
 
     # ----- checks -----
 
@@ -111,7 +118,9 @@ class NodeAgent:
                      "" if storage_ok else f" ({detail})")
 
     def _heartbeat(self):
-        body = {"node_id": self.node_id, "worker_count": self.worker_count, "jobs": []}
+        with self._jobs_lock:
+            running = list(self._jobs.keys())
+        body = {"node_id": self.node_id, "worker_count": self.worker_count, "jobs": running}
         r = requests.post(f"{self.master}/api/cluster/heartbeat",
                           json=body, headers=self._headers(), timeout=10)
         if r.status_code == 409:  # master lost us (restart) — re-register next tick
@@ -119,7 +128,86 @@ class NodeAgent:
             logging.info("[NODE] master asked us to re-register")
             return
         r.raise_for_status()
-        # Phase 2: act on r.json().get("assignment")
+        assignment = (r.json() or {}).get("assignment")
+        if assignment:
+            self._accept_job(assignment)
+
+    # ----- job execution -----
+
+    def _accept_job(self, job: dict):
+        """Take a job the master handed us and run it on the shared storage."""
+        job_id = job.get("id")
+        if not job_id:
+            return
+        with self._jobs_lock:
+            if job_id in self._jobs:
+                return  # already running (duplicate assignment)
+            self._jobs[job_id] = 0.0
+        logging.info("[NODE] accepted job %s (%s)", job_id, job.get("base_name"))
+        if self._executor:
+            self._executor.submit(self._run_job, job)
+        else:  # agent stopping
+            with self._jobs_lock:
+                self._jobs.pop(job_id, None)
+
+    def _run_job(self, job: dict):
+        job_id = job["id"]
+        temp_root = self.s.MEDIA_TEMP_FOLDER or "/temp"
+        progress_file = os.path.join(temp_root, f".node-{job_id}.progress.json")
+        # Seed the progress file so the streamer has something to read from the start.
+        with contextlib.suppress(Exception):
+            with open(progress_file, "w", encoding="utf-8") as f:
+                json.dump({"progress": 0.0}, f)
+        stop_prog = threading.Event()
+        pt = threading.Thread(target=self._stream_progress,
+                              args=(job_id, progress_file, stop_prog),
+                              daemon=True, name=f"node-prog-{job_id}")
+        pt.start()
+        ok = False
+        try:
+            from .pipeline import _execute_transcode
+            ok = _execute_transcode(
+                job["input_path"], job.get("srt_path"), job["tmp_out_path"],
+                job["base_name"], self.s, progress_file,
+                settings_override=job.get("settings_override") or {},
+                register_path="",
+            )
+        except Exception as e:
+            logging.error("[NODE] job %s crashed: %s", job_id, e)
+            ok = False
+        finally:
+            stop_prog.set()
+            with contextlib.suppress(Exception):
+                if os.path.exists(progress_file):
+                    os.remove(progress_file)
+            with self._jobs_lock:
+                self._jobs.pop(job_id, None)
+        self._report_job(job_id, "complete" if ok else "failed")
+
+    def _stream_progress(self, job_id: str, progress_file: str, stop: threading.Event):
+        """Poll the ffmpeg progress file and stream the percentage to the master."""
+        last = -1.0
+        while not stop.wait(2.0):
+            pct = 0.0
+            with contextlib.suppress(Exception):
+                with open(progress_file, "r", encoding="utf-8") as f:
+                    pct = float(json.load(f).get("progress") or 0.0)
+            with self._jobs_lock:
+                if job_id in self._jobs:
+                    self._jobs[job_id] = pct
+            if pct != last:
+                last = pct
+                self._report_job(job_id, "progress", {"progress": pct})
+
+    def _report_job(self, job_id: str, kind: str, extra: dict | None = None):
+        body = {"node_id": self.node_id}
+        if extra:
+            body.update(extra)
+        try:
+            requests.post(f"{self.master}/api/cluster/job/{job_id}/{kind}",
+                          json=body, headers=self._headers(), timeout=10)
+        except Exception as e:
+            logging.debug("[NODE] job %s %s report failed: %s", job_id, kind, e)
 
     def _loop(self):
         while not self._stop.is_set():
@@ -140,13 +228,19 @@ class NodeAgent:
         if not self.token:
             logging.error("[NODE] NODE_TOKEN not set — cannot authenticate to the master")
             return
+        # Pool that executes assigned jobs, sized to what this node advertises.
+        self._executor = ThreadPoolExecutor(max_workers=max(1, self.worker_count),
+                                            thread_name_prefix="node-job")
         self._thread = threading.Thread(target=self._loop, daemon=True, name="node-agent")
         self._thread.start()
-        logging.info("[NODE] agent started, target master %s (heartbeat ~%.0fs)",
-                     self.master, self._interval)
+        logging.info("[NODE] agent started, target master %s (heartbeat ~%.0fs, %d worker(s))",
+                     self.master, self._interval, self.worker_count)
 
     def stop(self):
         self._stop.set()
+        if self._executor:
+            self._executor.shutdown(wait=False)
+            self._executor = None
         try:  # best-effort clean deregister
             requests.post(f"{self.master}/api/cluster/deregister",
                           json={"node_id": self.node_id}, headers=self._headers(), timeout=3)

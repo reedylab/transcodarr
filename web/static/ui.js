@@ -272,6 +272,33 @@ async function updateWorkerStatus() {
       if (manualGroup) manualGroup.title = mw > 0 ? `Manual: ${am} active / ${mw} workers` : "Manual: disabled";
     }
   } catch {}
+  updateClusterHeader();
+}
+
+// Piggybacks on the worker-status poll: show a NODES header group with the online
+// node count + aggregate worker total, hidden when no nodes are connected.
+let _clusterHeaderMissing = 0;
+async function updateClusterHeader() {
+  const group = $("#nodes-group");
+  if (!group) return;
+  try {
+    const r = await fetch(`${API}/cluster/nodes`, {cache: "no-store"});
+    if (!r.ok) return;
+    const d = await r.json();
+    const online = (d.nodes || []).filter(n => n.online && n.storage_ok).length;
+    if (!d.clustering_enabled || online === 0) {
+      group.style.display = "none";
+      return;
+    }
+    group.style.display = "";
+    const c = $("#nodes-count"); if (c) c.textContent = String(online);
+    const w = $("#nodes-workers"); if (w) w.textContent = `+${d.node_worker_total}`;
+    group.title = `${online} node(s) online · +${d.node_worker_total} workers available`;
+    _clusterHeaderMissing = 0;
+  } catch {
+    // hide after a few consecutive failures so a blip doesn't flap it
+    if (++_clusterHeaderMissing > 3) group.style.display = "none";
+  }
 }
 
 // Action buttons for items
@@ -2048,6 +2075,12 @@ function _updateSelectAllBanner(type) { /* no-op until kickoff installs real imp
       return;
     }
 
+    // Special handling for the cluster — connected nodes + aggregate
+    if (section.type === "cluster") {
+      renderClusterSection(container, section);
+      return;
+    }
+
     // Special handling for encoding section — presets + two-column layout
     if (sectionKey === "encoding") {
       renderEncodingSection(container, section);
@@ -3574,6 +3607,73 @@ function _updateSelectAllBanner(type) { /* no-op until kickoff installs real imp
       </div>`;
     const goto = container.querySelector("#hw-goto-encoding");
     if (goto) goto.addEventListener("click", () => showSettingsSection("encoding"));
+  }
+
+  // ----- Settings → Cluster: connected nodes -----
+  function _clusterNodeRow(n) {
+    const online = n.online;
+    const caps = n.capabilities || {};
+    const backends = (caps.backends || [])
+      .filter(b => b.available && b.id !== "software")
+      .map(b => `<span class="hw-codec">${escapeHtml(b.id)}</span>`).join("") || `<span class="hw-codec">software</span>`;
+    const storage = n.storage_ok
+      ? ""
+      : `<div class="hw-detail" style="color:var(--danger)">storage: ${escapeHtml(n.storage_detail || "not visible")}</div>`;
+    const state = online
+      ? `${n.worker_count} workers`
+      : `offline (last seen ${n.last_seen_age}s ago)`;
+    return `
+      <div class="hw-row${online && n.storage_ok ? " hw-on" : " hw-off"}">
+        <div class="hw-status">${online ? "●" : "○"}</div>
+        <div class="hw-main">
+          <div class="hw-name">${escapeHtml(n.node_id)}</div>
+          <div class="hw-detail">${escapeHtml(n.address || "")}</div>${storage}
+        </div>
+        <div class="hw-codecs">${backends}</div>
+        <div class="hw-sessions">${escapeHtml(state)}</div>
+      </div>`;
+  }
+
+  async function renderClusterSection(container) {
+    container.innerHTML = `<div class="hw-note">Loading cluster…</div>`;
+    let data;
+    try {
+      data = await (await fetch(`${API}/cluster/nodes`, {cache: "no-store"})).json();
+    } catch {
+      container.innerHTML = `<div class="hw-note">Could not load cluster info.</div>`;
+      return;
+    }
+
+    if (!data.clustering_enabled) {
+      container.innerHTML = `
+        <div class="hw-disabled">
+          <div class="hw-empty-head">Clustering not enabled</div>
+          <p>Set a shared <code>NODE_TOKEN</code> in <code>.env</code> to let node
+             installations register with this master and add their workers to the pool.</p>
+          <p>On each node, run the same image with
+             <code>TRANSCODARR_MODE=node</code>, <code>MASTER_URL</code>, and the same
+             <code>NODE_TOKEN</code> — the node must mount the same media at the same paths.</p>
+        </div>`;
+      return;
+    }
+
+    const nodes = data.nodes || [];
+    const onlineCount = nodes.filter(n => n.online && n.storage_ok).length;
+    const rows = nodes.length ? nodes.map(_clusterNodeRow).join("")
+      : `<div class="hw-note">No nodes connected yet.</div>`;
+
+    container.innerHTML = `
+      <div class="hw-active-banner">
+        ${onlineCount} node${onlineCount === 1 ? "" : "s"} online ·
+        <b>+${data.node_worker_total}</b> node workers available
+      </div>
+      <div class="hw-subhead">Connected nodes</div>
+      <div class="hw-body">${rows}</div>
+      <div class="hw-enable">
+        Nodes register themselves — start the same image elsewhere with
+        <code>TRANSCODARR_MODE=node</code>, <code>MASTER_URL</code> pointing here, and
+        the matching <code>NODE_TOKEN</code>, mounting the same media at the same paths.
+      </div>`;
   }
 
   async function loadStorageHistory() {

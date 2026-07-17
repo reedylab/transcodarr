@@ -247,6 +247,12 @@ SETTINGS_SCHEMA = {
         "type": "hardware",
         "fields": {},
     },
+    # Custom-rendered (renderClusterSection): connected nodes + aggregate. No fields.
+    "cluster": {
+        "label": "Cluster",
+        "type": "cluster",
+        "fields": {},
+    },
     "integrations": {
         "label": "Integrations",
         "type": "integrations",

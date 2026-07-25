@@ -684,9 +684,9 @@ def build_ffmpeg_cmd(file_path: str, srt_path: str, out_temp: str, settings=None
     if out_ext == ".mp4":
         cmd += ["-movflags", "+faststart"]
     cmd += [
-        "-fflags", "+genpts",
+        "-fflags", "+genpts+igndts",  # regen PTS and drop broken input DTS -> fixes non-monotonic DTS
         "-max_muxing_queue_size", "4096",
-        "-max_interleave_delta", "0",  # helps with odd interleaving
+        "-max_interleave_delta", "1000000",  # 1s bounded; 0 = unlimited buffering -> OOM on copy + slow-audio encode
         "-avoid_negative_ts", "make_zero",  # safer timestamps
         out_temp
     ]
@@ -704,8 +704,9 @@ def build_sub_copy_mux_cmd(video_no_subs: str, srt_path: str, out_with_subs: str
         "-map","0:v:0","-map","0:a:0?","-map","1:0",
         "-c","copy","-c:s","mov_text","-metadata:s:s:0","language=eng",
         "-map_metadata","-1","-map_chapters","-1","-movflags","+faststart",
+        "-fflags", "+genpts+igndts",  # regen PTS and drop broken input DTS -> fixes non-monotonic DTS
         "-max_muxing_queue_size","4096",
-        "-max_interleave_delta", "0",  # helps with odd interleaving
+        "-max_interleave_delta", "1000000",  # 1s bounded; 0 = unlimited buffering -> OOM on sparse streams
         "-avoid_negative_ts", "make_zero",  # safer timestamps
         out_with_subs
     ]
